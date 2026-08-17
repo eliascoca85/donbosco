@@ -25,13 +25,13 @@ const STEPS = [
   { n: 4, title: 'Acompana el estado', text: 'Consulta el avance hasta la decision final.' },
 ]
 
-export function LandingPage() {
+export function ServicesPage() {
   return (
     <div className="landing">
       <section className="hero">
         <div className="hero-inner">
           <div className="hero-copy">
-            <span className="hero-eyebrow">Unidad Educativa · Mariscal Santa Cruz</span>
+            <span className="hero-eyebrow">Sistema escolar · U.E. Don Bosco</span>
             <h1 className="hero-title">
               Sistema de <span className="grad">permisos y licencias</span> escolares
             </h1>
@@ -139,7 +139,7 @@ export function LandingPage() {
             <p>
               Av. Educacion 1234 · La Paz, Bolivia
               <br />
-              Tel.: +591 (2) 222-3344 · administracion@colegio.edu
+              Tel.: +591 (2) 222-3344 · administracion@donbosco.edu
             </p>
           </div>
           <div className="contact-cta">
@@ -155,11 +155,11 @@ export function LandingPage() {
 
       <footer className="footer">
         <div>
-          <span className="crest">U</span> U.E. Mariscal Santa Cruz — {new Date().getFullYear()}
+          <span className="crest">D</span> U.E. Don Bosco — {new Date().getFullYear()}
         </div>
         <div className="footer-links">
-          <a href="#/">Inicio</a>
-          <a href="#/#servicios">Servicios</a>
+          <Link to="/">Inicio</Link>
+          <Link to="/servicios">Servicios</Link>
           <a href="#/#contacto">Contacto</a>
         </div>
       </footer>

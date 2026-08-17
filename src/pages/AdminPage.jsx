@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   getLeaveRequests,
   updateRequestStatus,
@@ -17,6 +17,8 @@ import {
   EvidencePreview,
   EvidenceLightbox,
 } from '../components/EvidencePreview'
+import { RectorManagementPanel } from '../components/RectorManagementPanel'
+import { TeacherManagementPanel } from '../components/TeacherManagementPanel'
 
 const ALLOWED_ROLES = [ROLES.ADMIN, ROLES.INSPECTOR, ROLES.TEACHER]
 
@@ -63,10 +65,9 @@ function Gate({ message, cta }) {
 }
 
 function AdminReviewPanel({ user, logout }) {
-  const initial = getLeaveRequests()
-  const initialId = initial[0]?.id || null
-  const [data, setData] = useState(initial)
-  const [selectedId, setSelectedId] = useState(initialId)
+  const [data, setData] = useState([])
+  const [selectedId, setSelectedId] = useState(null)
+  const [loading, setLoading] = useState(true)
   const [filters, setFilters] = useState({
     status: 'all',
     request_type: 'all',
@@ -78,6 +79,20 @@ function AdminReviewPanel({ user, logout }) {
   const [decision, setDecision] = useState(null)
   const [lightbox, setLightbox] = useState(null)
   const [toast, setToast] = useState(null)
+  const [loadingDecision, setLoadingDecision] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    getLeaveRequests().then((items) => {
+      if (!alive) return
+      setData(items)
+      setSelectedId(items[0]?.id || null)
+      setLoading(false)
+    })
+    return () => {
+      alive = false
+    }
+  }, [])
 
   const filtered = useMemo(() => filterAndSort(data, filters), [data, filters])
   const selected = useMemo(
@@ -96,12 +111,18 @@ function AdminReviewPanel({ user, logout }) {
     return mode === 'pre_approve' || mode === 'info_required'
   }
 
-  const decide = (mode, { comment }) => {
-    const updated = updateRequestStatus(selected.id, mode, {
-      reviewerName: user.name,
-      comment,
-    })
-    setData((prev) => prev.map((r) => (r.id === selected.id ? updated : r)))
+  const decide = async (mode, { comment }) => {
+    if (!selected) return
+    setLoadingDecision(true)
+    const updated = await updateRequestStatus(selected.id, mode, { comment })
+    setLoadingDecision(false)
+    if (!updated.ok) {
+      showToast('danger', updated.error || 'No se pudo actualizar la solicitud.')
+      return
+    }
+    const fresh = await getLeaveRequests()
+    setData(fresh)
+    setSelectedId(updated.item?.id || selected.id)
     setDecision(null)
     const labels = {
       approve: 'Licencia aprobada — comprobante PDF generado.',
@@ -112,15 +133,34 @@ function AdminReviewPanel({ user, logout }) {
     showToast('success', labels[mode] || 'Accion realizada.')
   }
 
+  const [activeTab, setActiveTab] = useState('requests')
   const reviewerRoleLabel = ROLE_LABELS[user?.role] || ''
 
   return (
     <div className="app-shell admin-shell">
       <header className="app-header">
         <div className="brand">
-          <span className="crest">U</span>
-          <span>U.E. Mariscal Santa Cruz · Panel de revision</span>
+          <span className="crest">DB</span>
+          <span>U.E. Don Bosco · Panel de control</span>
         </div>
+        {(user.role === ROLES.ADMIN || user.role === ROLES.TEACHER) && (
+          <div className="nav-tabs" style={{ display: 'flex', gap: 8, margin: '0 16px' }}>
+            <button
+              className={`btn ${activeTab === 'requests' ? 'primary' : 'ghost'}`}
+              onClick={() => setActiveTab('requests')}
+              style={{ fontSize: 13, padding: '6px 14px' }}
+            >
+              Licencias
+            </button>
+            <button
+              className={`btn ${activeTab === 'management' ? 'primary' : 'ghost'}`}
+              onClick={() => setActiveTab('management')}
+              style={{ fontSize: 13, padding: '6px 14px' }}
+            >
+              {user.role === ROLES.ADMIN ? 'Regencia / Cursos' : 'Alumnos y Cursos'}
+            </button>
+          </div>
+        )}
         <div className="user">
           <span className="avatar">{initialsOf(user.name)}</span>
           <span className="who">
@@ -136,59 +176,74 @@ function AdminReviewPanel({ user, logout }) {
         </div>
       </header>
 
-      <Stats data={data} />
+      {activeTab === 'requests' ? (
+        <>
+          <Stats data={data} />
 
-      <LeaveFilterBar
-        filters={filters}
-        onChange={setFilters}
-        totalCount={data.length}
-        visibleCount={filtered.length}
-      />
+          {loading ? (
+            <div className="panel" style={{ padding: 20, marginBottom: 14 }}>
+              Cargando solicitudes...
+            </div>
+          ) : null}
 
-      <div className="review-grid">
-        <section className="panel">
-          <div className="panel-head">
-            <h2>Solicitudes entrantes</h2>
-            <span className="count">{filtered.length}</span>
-          </div>
-          <div className="list">
-            {filtered.length === 0 ? (
-              <div
-                style={{
-                  padding: 32,
-                  textAlign: 'center',
-                  color: 'var(--text-muted)',
-                  fontSize: 13,
-                }}
-              >
-                No existen solicitudes que coincidan con los filtros.
+          <LeaveFilterBar
+            filters={filters}
+            onChange={setFilters}
+            totalCount={data.length}
+            visibleCount={filtered.length}
+          />
+
+          <div className="review-grid">
+            <section className="panel">
+              <div className="panel-head">
+                <h2>Solicitudes entrantes</h2>
+                <span className="count">{filtered.length}</span>
               </div>
-            ) : (
-              filtered.map((r) => (
-                <LeaveRow
-                  key={r.id}
-                  req={r}
-                  active={selected && r.id === selected.id}
-                  onClick={() => setSelectedId(r.id)}
-                />
-              ))
-            )}
-          </div>
-        </section>
+              <div className="list">
+                {filtered.length === 0 ? (
+                  <div
+                    style={{
+                      padding: 32,
+                      textAlign: 'center',
+                      color: 'var(--text-muted)',
+                      fontSize: 13,
+                    }}
+                  >
+                    No existen solicitudes que coincidan con los filtros.
+                  </div>
+                ) : (
+                  filtered.map((r) => (
+                    <LeaveRow
+                      key={r.id}
+                      req={r}
+                      active={selected && r.id === selected.id}
+                      onClick={() => setSelectedId(r.id)}
+                    />
+                  ))
+                )}
+              </div>
+            </section>
 
-        <section className="panel">
-          {selected ? (
-            <RequestDetail
-              req={selected}
-              canDecide={canDecide}
-              onOpenEvidence={setLightbox}
-              onDecide={setDecision}
-            />
-          ) : (
-            <EmptyState />
-          )}
-        </section>
-      </div>
+            <section className="panel">
+              {selected ? (
+                <RequestDetail
+                  req={selected}
+                  canDecide={canDecide}
+                  onOpenEvidence={setLightbox}
+                  onDecide={setDecision}
+                />
+              ) : (
+                <EmptyState />
+              )}
+            </section>
+          </div>
+        </>
+      ) : (
+        <>
+          {user.role === ROLES.ADMIN && <RectorManagementPanel />}
+          {user.role === ROLES.TEACHER && <TeacherManagementPanel />}
+        </>
+      )}
 
       {decision && (
         <DecisionModal
@@ -197,6 +252,7 @@ function AdminReviewPanel({ user, logout }) {
           request={selected}
           onConfirm={decide}
           onClose={() => setDecision(null)}
+          loading={loadingDecision}
         />
       )}
 

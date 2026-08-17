@@ -1,14 +1,17 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useAuth, useRouter } from '../components/router'
 import { Link } from '../components/Link'
 import { ROLES } from '../api/auth'
 
+const REDIRECT_KEY = 'colegio.redirectAfterLogin'
+const ADMIN_ROLES = [ROLES.ADMIN, ROLES.INSPECTOR, ROLES.TEACHER]
+
 const DEMO = [
-  { username: 'estudiante', password: 'cole123', role: ROLES.STUDENT, label: 'Estudiante' },
-  { username: 'padre', password: 'cole123', role: ROLES.PARENT, label: 'Padre / Tutor' },
-  { username: 'docente', password: 'cole123', role: ROLES.TEACHER, label: 'Docente' },
-  { username: 'inspectoria', password: 'cole123', role: ROLES.INSPECTOR, label: 'Inspectoria' },
-  { username: 'rectora', password: 'cole123', role: ROLES.ADMIN, label: 'Direccion' },
+  { username: 'estudiante', password: 'estudiante123', role: ROLES.STUDENT, label: 'Estudiante' },
+  { username: 'padre', password: 'padre123', role: ROLES.PARENT, label: 'Padre / Tutor' },
+  { username: 'docente', password: 'docente123', role: ROLES.TEACHER, label: 'Docente' },
+  { username: 'inspectoria', password: 'inspectoria123', role: ROLES.INSPECTOR, label: 'Inspectoria' },
+  { username: 'rectora', password: 'rectora123', role: ROLES.ADMIN, label: 'Direccion' },
 ]
 
 export function LoginPage() {
@@ -18,51 +21,62 @@ export function LoginPage() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
-  const submit = (e) => {
+  const takeRedirect = () => {
+    let saved
+    try {
+      saved = sessionStorage.getItem(REDIRECT_KEY)
+      sessionStorage.removeItem(REDIRECT_KEY)
+    } catch {
+      saved = null
+    }
+    if (!saved || saved === '/login') return null
+    return saved
+  }
+
+  const redirectAfterLogin = (role) => {
+    const saved = takeRedirect()
+    if (saved) {
+      navigate(saved)
+      return
+    }
+    if (ADMIN_ROLES.includes(role)) {
+      navigate('/admin')
+    } else if (role === 'student' || role === 'parent') {
+      navigate('/dashboard')
+    } else {
+      navigate('/')
+    }
+  }
+
+  useEffect(() => {
+    if (user) redirectAfterLogin(user.role)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user])
+
+  const submit = async (e) => {
     e.preventDefault()
     setError('')
     setLoading(true)
-    setTimeout(() => {
-      const res = login(form)
-      setLoading(false)
-      if (!res.ok) {
-        setError(res.error)
-        return
-      }
-      redirectByRole(res.user.role, navigate)
-    }, 350)
-  }
-
-  const redirectByRole = (role, nav) => {
-    if (role === ROLES.ADMIN || role === ROLES.INSPECTOR || role === ROLES.TEACHER) {
-      nav('/admin')
-    } else {
-      nav('/permisos')
+    const res = await login(form)
+    setLoading(false)
+    if (!res.ok) {
+      setError(res.error)
+      return
     }
+    redirectAfterLogin(res.user.role)
   }
 
   if (user) {
     return (
       <div className="auth-wrap">
-        <div className="auth-card">
+        <div className="auth-card" style={{ alignItems: 'center' }}>
           <div className="auth-mark">
-            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M20 6L9 17l-5-5" />
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="spin">
+              <path d="M21 12a9 9 0 1 1-6.2-8.6" />
             </svg>
           </div>
-          <h1>Ya has iniciado sesion</h1>
-          <p>
-            Bienvenido de nuevo, <strong>{user.name}</strong>.
-          </p>
-          <button
-            className="btn primary"
-            onClick={() => redirectByRole(user.role, navigate)}
-          >
-            Ir a mi panel
-          </button>
-          <Link to="/" className="btn ghost">
-            Volver al inicio
-          </Link>
+          <h1>Bienvenido, {user.name.split(' ').slice(0, 2).join(' ')}</h1>
+          <p>Redirigiendo a tu panel...</p>
         </div>
       </div>
     )
@@ -72,9 +86,9 @@ export function LoginPage() {
     <div className="auth-wrap">
       <div className="auth-card">
         <div className="auth-head">
-          <span className="crest">U</span>
+          <span className="crest">DB</span>
           <h1>Acceso al sistema</h1>
-          <p>Inicia sesion para verificar tu identidad y recibir un rol.</p>
+          <p>Inicia sesion para solicitar un permiso o gestionar licencias.</p>
         </div>
 
         <form onSubmit={submit} className="auth-form" noValidate>
@@ -123,8 +137,6 @@ export function LoginPage() {
         </div>
 
         <div className="auth-foot">
-          <Link to="/permisos">Solicitar permiso sin cuenta</Link>
-          <span>·</span>
           <Link to="/">Volver al inicio</Link>
         </div>
       </div>

@@ -93,7 +93,7 @@ export function LeaveFilterBar({ filters, onChange, totalCount, visibleCount }) 
         Limpiar
       </button>
 
-      <span style={{ fontSize: 12, color: 'var(--text-muted)', alignSelf: 'flex-end' }}>
+      <span className="result-count">
         {visibleCount} de {totalCount} solicitudes
       </span>
     </div>

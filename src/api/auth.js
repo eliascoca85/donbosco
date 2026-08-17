@@ -1,5 +1,4 @@
-// Capa de autenticacion basada en mocks en memoria.
-// Reemplazar por llamadas fetch(VITE_API_URL + '/auth/login') cuando el backend exista.
+import { apiRequest, clearStoredSession, getStoredToken, getStoredUser, storeSession } from './client'
 
 export const ROLES = {
   STUDENT: 'student',
@@ -13,106 +12,50 @@ export const ROLE_LABELS = {
   student: 'Estudiante',
   parent: 'Padre / Tutor',
   teacher: 'Docente',
-  inspector: 'Inspectoria',
+  inspector: 'Inspectoría',
   admin: 'Administracion / Direccion',
 }
 
-const USERS = [
-  {
-    id: 'u-stu-1',
-    username: 'estudiante',
-    password: 'cole123',
-    name: 'Maria Fernanda Quispe Mamani',
-    email: 'maria.quispe@colegio.edu',
-    role: ROLES.STUDENT,
-    course: '2do Secundaria A',
-  },
-  {
-    id: 'u-par-1',
-    username: 'padre',
-    password: 'cole123',
-    name: 'Rosa Elena Calle Tarqui',
-    email: 'rosa.calle@colegio.edu',
-    role: ROLES.PARENT,
-    course: '1ro Secundaria A',
-  },
-  {
-    id: 'u-tea-1',
-    username: 'docente',
-    password: 'cole123',
-    name: 'Carlos Mendoza',
-    email: 'carlos.mendoza@colegio.edu',
-    role: ROLES.TEACHER,
-    course: 'Personal docente',
-  },
-  {
-    id: 'u-ins-1',
-    username: 'inspectoria',
-    password: 'cole123',
-    name: 'Juan Flores',
-    email: 'juan.flores@colegio.edu',
-    role: ROLES.INSPECTOR,
-    course: 'Inspectoria general',
-  },
-  {
-    id: 'u-adm-1',
-    username: 'rectora',
-    password: 'cole123',
-    name: 'Rosa Azcarraga',
-    email: 'rosa.azcarraga@colegio.edu',
-    role: ROLES.ADMIN,
-    course: 'Direccion',
-  },
-]
+export function getCurrentUser() {
+  return getStoredUser()
+}
 
-const SESSION_KEY = 'colegio.session'
+export async function restoreCurrentUser() {
+  const token = getStoredToken()
+  const cached = getStoredUser()
+  if (!token) return cached
 
-function readSession() {
-  try {
-    const raw = sessionStorage.getItem(SESSION_KEY)
-    return raw ? JSON.parse(raw) : null
-  } catch {
+  const res = await apiRequest('/auth/me')
+  if (!res.ok || !res.user) {
+    clearStoredSession()
     return null
   }
+
+  storeSession({ token, user: res.user })
+  return res.user
 }
 
-function writeSession(user) {
-  if (user) sessionStorage.setItem(SESSION_KEY, JSON.stringify(user))
-  else sessionStorage.removeItem(SESSION_KEY)
-}
+export async function login({ username, password }) {
+  const res = await apiRequest('/auth/login', {
+    method: 'POST',
+    auth: false,
+    body: { username, password },
+  })
 
-function publicUser(u) {
-  if (!u) return null
-  return {
-    id: u.id,
-    username: u.username,
-    name: u.name,
-    email: u.email,
-    role: u.role,
-    course: u.course,
+  if (!res.ok) {
+    return { ok: false, error: res.error || 'Usuario o contrasena incorrectos.' }
   }
+
+  storeSession({ token: res.token, user: res.user })
+  return { ok: true, user: res.user }
 }
 
-export function getCurrentUser() {
-  return publicUser(readSession())
-}
-
-export function login({ username, password }) {
-  const found = USERS.find(
-    (u) =>
-      u.username.toLowerCase() === String(username || '').toLowerCase() &&
-      u.password === password
-  )
-  if (!found) {
-    return { ok: false, error: 'Usuario o contrasena incorrectos.' }
+export async function logout() {
+  try {
+    await apiRequest('/auth/logout', { method: 'POST' })
+  } finally {
+    clearStoredSession()
   }
-  const pub = publicUser(found)
-  writeSession(pub)
-  return { ok: true, user: pub }
-}
-
-export function logout() {
-  writeSession(null)
 }
 
 export function hasRole(user, roles) {

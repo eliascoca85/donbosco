@@ -56,14 +56,14 @@ export function DecisionModal({ mode, request, onConfirm, onClose }) {
           </button>
         </div>
         <div className="body">
-          <div style={{ fontSize: 14 }}>
+          <div className="modal-request">
             Solicitud{' '}
-            <span style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
+            <span className="code">
               {request.tracking_code}
             </span>{' '}
             de <strong>{request.applicant.name}</strong>
             <br />
-            <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+            <span className="meta">
               {request.course} ·{' '}
               {request.applicant.email}
             </span>
@@ -79,11 +79,11 @@ export function DecisionModal({ mode, request, onConfirm, onClose }) {
               }}
             />
             {err ? (
-              <div className="hint" style={{ color: 'var(--danger)' }}>
+              <div className="modal-hint warn">
                 {err}
               </div>
             ) : (
-              <div className="hint">
+              <div className="modal-hint">
                 {cfg.requiresComment
                   ? 'El comentario es obligatorio.'
                   : 'Opcional: se registrara en audit_logs.'}

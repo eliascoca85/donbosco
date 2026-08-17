@@ -70,8 +70,8 @@ export function AdminReviewPanel() {
     <div className="app-shell">
       <header className="app-header">
         <div className="brand">
-          <span className="crest">U</span>
-          <span>U.E. Mariscal Santa Cruz · Licencias</span>
+          <span className="crest">DB</span>
+          <span>U.E. Don Bosco · Licencias</span>
         </div>
         <div className="user">
           <span className="avatar">{CURRENT_USER.initials}</span>

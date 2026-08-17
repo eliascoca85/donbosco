@@ -3,6 +3,7 @@ import {
   getCurrentUser,
   login as apiLogin,
   logout as apiLogout,
+  restoreCurrentUser,
 } from '../api/auth'
 import { RouterContext, AuthContext } from './router'
 
@@ -16,13 +17,20 @@ export function AppProviders({ children }) {
   const [user, setUser] = useState(getCurrentUser())
 
   useEffect(() => {
+    let mounted = true
     const onHash = () => {
       setPath(parseHash())
       window.scrollTo(0, 0)
     }
     window.addEventListener('hashchange', onHash)
     if (!window.location.hash) window.location.hash = '/'
-    return () => window.removeEventListener('hashchange', onHash)
+    restoreCurrentUser().then((current) => {
+      if (mounted) setUser(current)
+    })
+    return () => {
+      mounted = false
+      window.removeEventListener('hashchange', onHash)
+    }
   }, [])
 
   const navigate = useCallback((to) => {
@@ -31,15 +39,17 @@ export function AppProviders({ children }) {
   }, [])
 
   const login = useCallback((creds) => {
-    const res = apiLogin(creds)
-    if (res.ok) setUser(res.user)
-    return res
+    return apiLogin(creds).then((res) => {
+      if (res.ok) setUser(res.user)
+      return res
+    })
   }, [])
 
   const logout = useCallback(() => {
-    apiLogout()
-    setUser(null)
-    navigate('/')
+    return apiLogout().finally(() => {
+      setUser(null)
+      navigate('/')
+    })
   }, [navigate])
 
   const auth = useMemo(() => ({ user, login, logout }), [user, login, logout])

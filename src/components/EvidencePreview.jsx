@@ -3,8 +3,8 @@ import { formatBytes } from '../api/leaveRequests'
 export function EvidencePreview({ attachments, onOpen }) {
   if (!attachments || attachments.length === 0) {
     return (
-      <div className="panel" style={{ margin: '12px 0' }}>
-        <div style={{ padding: 16, color: 'var(--text-muted)', fontSize: 13 }}>
+      <div className="panel evidence-empty">
+        <div className="body">
           No hay evidencias adjuntas para esta solicitud.
         </div>
       </div>
@@ -23,10 +23,10 @@ export function EvidencePreview({ attachments, onOpen }) {
             {a.file_type === 'application/pdf' ? 'PDF' : 'IMG'}
           </span>
           <span className="meta">
-            <span className="name">{a.file_name}</span>
-            <span className="size">{formatBytes(a.file_size)}</span>
+            <span className="file-name">{a.file_name}</span>
+            <span className="file-size">{formatBytes(a.file_size)}</span>
           </span>
-          <span style={{ marginLeft: 6, color: 'var(--text-weak)' }} aria-hidden>
+          <span className="open-indicator" aria-hidden>
             ↗
           </span>
         </button>
@@ -44,7 +44,7 @@ export function EvidenceLightbox({ attachment, onClose }) {
         <div className="bar">
           <div>
             <strong>{attachment.file_name}</strong>{' '}
-            <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>
+            <span className="file-size">
               · {formatBytes(attachment.file_size)}
             </span>
           </div>
@@ -62,7 +62,7 @@ export function EvidenceLightbox({ attachment, onClose }) {
             <div className="pdf-stand">
               <div className="big">📄</div>
               <div>{attachment.file_name}</div>
-              <div style={{ opacity: 0.7, fontSize: 13, marginTop: 6 }}>
+              <div className="management-note evidence-note">
                 Vista previa de PDF · {formatBytes(attachment.file_size)}
               </div>
             </div>

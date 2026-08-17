@@ -1,1 +1,211 @@
-/* Estilos heredados de index.css. Reservado para sobrescrituras puntuales. */
+:root {
+	--surface-border: rgba(214, 218, 232, 0.9);
+}
+
+.admin-shell .review-grid + .management-shell {
+	margin-top: 14px;
+}
+
+.management-shell {
+	display: grid;
+	gap: 14px;
+}
+
+.management-banner {
+	padding: 0;
+}
+
+.management-banner .panel-head {
+	align-items: flex-start;
+}
+
+.management-banner .lead {
+	padding: 16px;
+	display: grid;
+	gap: 10px;
+}
+
+.management-grid {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 14px;
+}
+
+@media (max-width: 1100px) {
+	.management-grid {
+		grid-template-columns: 1fr;
+	}
+}
+
+.management-card {
+	overflow: hidden;
+}
+
+.management-card .panel-head {
+	align-items: center;
+}
+
+.management-form {
+	padding: 16px;
+	display: grid;
+	gap: 12px;
+}
+
+.management-form .form-grid,
+.management-form .form-grid-2 {
+	display: grid;
+	gap: 12px;
+}
+
+.management-form .form-grid-2 {
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (max-width: 720px) {
+	.management-form .form-grid-2 {
+		grid-template-columns: 1fr;
+	}
+}
+
+.management-list {
+	padding: 0 16px 16px;
+	display: grid;
+	gap: 10px;
+}
+
+.management-multiselect {
+	min-height: 140px;
+}
+
+.management-item {
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	background: var(--bg-elev);
+	padding: 12px;
+}
+
+.management-item .meta {
+	margin-top: 4px;
+	color: var(--text-muted);
+	font-size: 12px;
+}
+
+.management-item .children,
+.management-item .courses {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	margin-top: 8px;
+}
+
+.management-empty,
+.detail-empty,
+.dash-empty {
+	padding: 24px;
+	display: grid;
+	place-items: center;
+	text-align: center;
+	color: var(--text-muted);
+}
+
+.management-empty .big,
+.detail-empty .big,
+.dash-empty .big {
+	color: var(--text);
+	font-size: 16px;
+	font-weight: 700;
+	margin-top: 10px;
+}
+
+.management-empty p,
+.detail-empty p,
+.dash-empty p {
+	max-width: 36ch;
+}
+
+.management-message {
+	font-size: 13px;
+	color: var(--text-muted);
+	margin: 0;
+}
+
+.management-alert {
+	font-size: 13px;
+	color: var(--danger);
+}
+
+.management-success {
+	font-size: 13px;
+	color: var(--success);
+}
+
+.management-note {
+	font-size: 12px;
+	color: var(--text-muted);
+}
+
+.evidence-note {
+	margin-top: 6px;
+}
+
+.toolbar .result-count {
+	font-size: 12px;
+	color: var(--text-muted);
+	align-self: flex-end;
+	white-space: nowrap;
+}
+
+.modal-request {
+	display: grid;
+	gap: 8px;
+	font-size: 14px;
+}
+
+.modal-request .code {
+	font-family: var(--mono);
+	font-size: 12px;
+}
+
+.modal-request .meta {
+	color: var(--text-muted);
+	font-size: 12px;
+}
+
+.modal-hint {
+	color: var(--text-muted);
+	font-size: 12px;
+}
+
+.modal-hint.warn {
+	color: var(--danger);
+}
+
+.evidence-empty {
+	margin: 12px 0;
+}
+
+.evidence-empty .body {
+	padding: 16px;
+	color: var(--text-muted);
+	font-size: 13px;
+}
+
+.evidence .file-name {
+	font-weight: 600;
+}
+
+.evidence .file-size {
+	color: var(--text-muted);
+	font-size: 12px;
+}
+
+.evidence .open-indicator {
+	margin-left: 6px;
+	color: var(--text-weak);
+}
+
+.status-pill {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}

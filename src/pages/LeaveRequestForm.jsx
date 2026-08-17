@@ -17,6 +17,7 @@ const EMPTY = {
 
 export function LeaveRequestForm() {
   const { user } = useAuth()
+  const linkedStudents = user?.linkedStudents || []
   const [form, setForm] = useState(() =>
     user
       ? {
@@ -24,12 +25,16 @@ export function LeaveRequestForm() {
           applicant_name: user.name,
           course: user.course || '',
           email: user.email || '',
+          student_id: linkedStudents[0]?.id || '',
         }
       : EMPTY
   )
   const [errors, setErrors] = useState({})
   const [submitted, setSubmitted] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState('')
+
+  const activeStudentId = form.student_id || linkedStudents[0]?.id || ''
 
   const set = (patch) => setForm((p) => ({ ...p, ...patch }))
   const hours = useMemo(
@@ -46,6 +51,7 @@ export function LeaveRequestForm() {
   const validate = () => {
     const e = {}
     if (!form.applicant_name.trim()) e.applicant_name = 'Indica tu nombre completo.'
+    if (user?.role === 'parent' && !form.student_id) e.student_id = 'Selecciona un estudiante vinculado.'
     if (!form.request_type) e.request_type = 'Selecciona un tipo.'
     if (!form.start_date) e.start_date = 'Indica la fecha de inicio.'
     if (!form.end_date) e.end_date = 'Indica la fecha de fin.'
@@ -77,13 +83,22 @@ export function LeaveRequestForm() {
     e.preventDefault()
     window.scrollTo(0, 0)
     setSubmitted(null)
+    setSubmitError('')
     if (!validate()) return
     setSubmitting(true)
-    setTimeout(() => {
-      const req = createLeaveRequest(form, { applicantUser: user })
-      setSubmitting(false)
-      setSubmitted(req)
-    }, 400)
+    createLeaveRequest({ ...form, student_id: activeStudentId })
+      .then((res) => {
+        setSubmitting(false)
+        if (!res.ok) {
+          setSubmitError(res.error || 'No se pudo registrar la solicitud.')
+          return
+        }
+        setSubmitted(res.item)
+      })
+      .catch(() => {
+        setSubmitting(false)
+        setSubmitError('No se pudo registrar la solicitud.')
+      })
   }
 
   if (submitted) {
@@ -95,6 +110,16 @@ export function LeaveRequestForm() {
 
   return (
     <div className="form-page">
+      <div className="form-portal-head">
+        <Link to="/" className="lnav-brand">
+          <span className="crest">DB</span>
+          <span className="lnav-brand-name">U.E. <strong>Don Bosco</strong></span>
+        </Link>
+          <span className="form-portal-user">
+          Hola, {user.name.split(' ').slice(0, 2).join(' ')}
+        </span>
+      </div>
+
       <div className="form-banner">
         <span className="hero-eyebrow">Solicitud de permiso / licencia</span>
         <h1>Completa el formulario</h1>
@@ -127,6 +152,20 @@ export function LeaveRequestForm() {
                 disabled={!!user}
               />
             </Field>
+            <Field label="Estudiante" required={user?.role === 'parent'} error={errors.student_id}>
+              <select
+                value={activeStudentId}
+                onChange={(e) => set({ student_id: e.target.value })}
+                disabled={linkedStudents.length === 0}
+              >
+                <option value="">Selecciona un estudiante</option>
+                {linkedStudents.map((student) => (
+                  <option key={student.id} value={student.id}>
+                    {student.name} · {student.course || 'Sin curso'}
+                  </option>
+                ))}
+              </select>
+            </Field>
             <Field label="Email" optional error={errors.email}>
               <input
                 value={form.email}
@@ -142,18 +181,6 @@ export function LeaveRequestForm() {
                 placeholder="+591 7XX XXXXX"
               />
             </Field>
-            {!user && (
-              <Field label="Calidad del solicitante" optional>
-                <select
-                  value={form.applicant_kind}
-                  onChange={(e) => set({ applicant_kind: e.target.value })}
-                >
-                  <option value="student">Estudiante</option>
-                  <option value="parent">Padre / Tutor</option>
-                  <option value="personal">Personal</option>
-                </select>
-              </Field>
-            )}
           </div>
         </fieldset>
 
@@ -208,6 +235,12 @@ export function LeaveRequestForm() {
             </Field>
           </div>
         </fieldset>
+
+        {submitError && (
+          <div className="auth-err" style={{ marginTop: 4 }}>
+            {submitError}
+          </div>
+        )}
 
         <fieldset className="form-card">
           <legend>Evidencias adjuntas</legend>

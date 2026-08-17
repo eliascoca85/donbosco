@@ -18,7 +18,7 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
-    CREATE TYPE role_name   AS ENUM ('admin', 'revisor', 'solicitante');
+    CREATE TYPE role_name AS ENUM ('admin', 'inspector', 'teacher', 'parent', 'student');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
@@ -56,9 +56,11 @@ CREATE TABLE IF NOT EXISTS roles (
 
 -- Semilla inicial de roles
 INSERT INTO roles (name, description) VALUES
-    ('admin',       'Direccion / Inspectoria - control total'),
-    ('revisor',     'Tutor / Profesor jefe - pre-dictamen por curso/area'),
-    ('solicitante', 'Estudiante / Apoderado / Personal - crea y consulta sus solicitudes')
+    ('admin',     'Regente / Direccion - control total y gestion de credenciales'),
+    ('inspector', 'Inspectoria - acompanamiento y disciplina'),
+    ('teacher',   'Docente / Tutor - revisa permisos de sus cursos asignados'),
+    ('parent',    'Padre / Tutor - solicita permisos para sus hijos'),
+    ('student',   'Estudiante - no solicita permisos, solo ve su panel de faltas')
 ON CONFLICT (name) DO NOTHING;
 
 -- ----------------------------------------------------------------------------
@@ -66,6 +68,7 @@ ON CONFLICT (name) DO NOTHING;
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS users (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username      TEXT NOT NULL UNIQUE CHECK (length(btrim(username)) >= 3),
     name          TEXT NOT NULL CHECK (length(btrim(name)) >= 3),
     email         CITEXT NOT NULL UNIQUE CHECK (email ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$'),
     password_hash TEXT NOT NULL,
@@ -194,7 +197,27 @@ CREATE INDEX IF NOT EXISTS idx_lr_pending      ON leave_requests(status, created
     WHERE deleted_at IS NULL;
 
 -- ----------------------------------------------------------------------------
--- 10. Tabla: request_attachments  (evidencias / comprobantes)
+-- 10. Tabla: student_absences  (inasistencias para dashboard)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS student_absences (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id    UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    request_id    UUID REFERENCES leave_requests(id) ON DELETE SET NULL,
+    course_id     SMALLINT REFERENCES courses(id) ON DELETE SET NULL,
+    absence_date  DATE NOT NULL,
+    reason        TEXT NOT NULL,
+    licensed      BOOLEAN NOT NULL DEFAULT false,
+    tracking_code TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_absences_student ON student_absences(student_id);
+CREATE INDEX IF NOT EXISTS idx_absences_date ON student_absences(absence_date DESC);
+CREATE INDEX IF NOT EXISTS idx_absences_request ON student_absences(request_id);
+
+-- ----------------------------------------------------------------------------
+-- 11. Tabla: request_attachments  (evidencias / comprobantes)
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS request_attachments (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -213,7 +236,7 @@ CREATE TABLE IF NOT EXISTS request_attachments (
 CREATE INDEX IF NOT EXISTS idx_att_request ON request_attachments(request_id);
 
 -- ----------------------------------------------------------------------------
--- 11. Tabla: audit_logs  (auditoria completa de acciones administrativas)
+-- 12. Tabla: audit_logs  (auditoria completa de acciones administrativas)
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS audit_logs (
     id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -289,6 +312,10 @@ DROP TRIGGER IF EXISTS trg_lr_tracking_code ON leave_requests;
 CREATE TRIGGER trg_lr_tracking_code BEFORE INSERT ON leave_requests
     FOR EACH ROW EXECUTE FUNCTION fn_gen_tracking_code();
 
+DROP TRIGGER IF EXISTS trg_absences_updated_at ON student_absences;
+CREATE TRIGGER trg_absences_updated_at BEFORE UPDATE ON student_absences
+    FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
 -- ----------------------------------------------------------------------------
 -- Trigger: auditoria automatica de cambios de estado en leave_requests
 -- ----------------------------------------------------------------------------
@@ -362,13 +389,169 @@ WHERE lr.deleted_at IS NULL
   AND lr.status IN ('pending','pre_approved','info_required');
 
 -- ============================================================================
---  DATOS SEMILLA / DEMO  (opcional - comentar en produccion)
+--  DATOS SEMILLA / DEMO
 -- ============================================================================
-INSERT INTO users (name, email, password_hash, role_id, phone) VALUES
-    ('Administrador Colegio', 'admin@colegio.edu', crypt('admin123', gen_salt('bf')), 1, '+591-70000000'),
-    ('Tutor 1ro A',          'tutor@colegio.edu',  crypt('tutor123',  gen_salt('bf')), 2, '+591-70000001'),
-    ('Juan Perez Estudiante', 'juan@colegio.edu',   crypt('juan123',   gen_salt('bf')), 3, '+591-70000002')
-ON CONFLICT (email) DO NOTHING;
+
+-- Cursos
+INSERT INTO courses (name, level, school_year) VALUES
+    ('1ro Secundaria A', 'Secundaria', '2026'),
+    ('1ro Secundaria B', 'Secundaria', '2026'),
+    ('2do Secundaria A', 'Secundaria', '2026'),
+    ('3ro Secundaria A', 'Secundaria', '2026'),
+    ('6to Primaria A',   'Primaria',   '2026')
+ON CONFLICT (name) DO NOTHING;
+
+-- Usuarios (uno por rol). passwords: <role>123  -> admin123, docente123, etc.
+INSERT INTO users (username, name, email, password_hash, role_id, phone) VALUES
+    ('rectora',     'Rosa Azcarraga',            'rosa.azcarraga@donbosco.edu',   crypt('rectora123',     gen_salt('bf')), (SELECT id FROM roles WHERE name='admin'),     '+591-70000001'),
+    ('inspectoria', 'Juan Flores',               'juan.flores@donbosco.edu',      crypt('inspectoria123', gen_salt('bf')), (SELECT id FROM roles WHERE name='inspector'), '+591-70000002'),
+    ('docente',     'Carlos Mendoza',            'carlos.mendoza@donbosco.edu',   crypt('docente123',     gen_salt('bf')), (SELECT id FROM roles WHERE name='teacher'),   '+591-70000003'),
+    ('padre',       'Rosa Elena Calle Tarqui',    'rosa.calle@donbosco.edu',       crypt('padre123',       gen_salt('bf')), (SELECT id FROM roles WHERE name='parent'),     '+591-70000004'),
+    ('estudiante',  'Maria Fernanda Quispe Mamani','maria.quispe@donbosco.edu',    crypt('estudiante123',  gen_salt('bf')), (SELECT id FROM roles WHERE name='student'),   '+591-70000005'),
+    ('estudiante2', 'Lucas Andres Choque Flores', 'lucas.choque@donbosco.edu',     crypt('estudiante123',  gen_salt('bf')), (SELECT id FROM roles WHERE name='student'),   '+591-70000006')
+ON CONFLICT (username) DO NOTHING;
+
+-- Perfiles de estudiante
+INSERT INTO students (user_id, ru_code, course_id, status) VALUES
+    ((SELECT id FROM users WHERE username='estudiante'),  'RUDE-0001', (SELECT id FROM courses WHERE name='2do Secundaria A'), 'active'),
+    ((SELECT id FROM users WHERE username='estudiante2'), 'RUDE-0002', (SELECT id FROM courses WHERE name='1ro Secundaria A'), 'active')
+ON CONFLICT (user_id) DO NOTHING;
+
+-- Perfil de padre y vinculacion N:M con sus hijos
+INSERT INTO guardians (user_id, ci_number) VALUES
+    ((SELECT id FROM users WHERE username='padre'), 'LP-1234567')
+ON CONFLICT (user_id) DO NOTHING;
+
+-- Vinculo padre -> estudiantes
+INSERT INTO student_guardians (student_id, guardian_id, relationship, is_primary) VALUES
+    ((SELECT id FROM students WHERE ru_code='RUDE-0001'), (SELECT id FROM guardians WHERE ci_number='LP-1234567'), 'padre', true),
+    ((SELECT id FROM students WHERE ru_code='RUDE-0002'), (SELECT id FROM guardians WHERE ci_number='LP-1234567'), 'padre', false)
+ON CONFLICT (student_id, guardian_id) DO NOTHING;
+
+-- Asignacion docente -> cursos
+INSERT INTO course_reviewers (course_id, reviewer_id) VALUES
+    ((SELECT id FROM courses WHERE name='1ro Secundaria A'), (SELECT id FROM users WHERE username='docente')),
+    ((SELECT id FROM courses WHERE name='2do Secundaria A'), (SELECT id FROM users WHERE username='docente')),
+    ((SELECT id FROM courses WHERE name='3ro Secundaria A'), (SELECT id FROM users WHERE username='inspectoria')),
+    ((SELECT id FROM courses WHERE name='1ro Secundaria B'), (SELECT id FROM users WHERE username='rectora'))
+ON CONFLICT (course_id, reviewer_id) DO NOTHING;
+
+-- Solicitudes demo funcionales
+INSERT INTO leave_requests (
+    tracking_code, applicant_id, applicant_kind, student_id, course_id,
+    request_type, start_date, end_date, reason, status,
+    pre_reviewed_by, pre_review_at, pre_review_comment,
+    reviewed_by, reviewed_at, review_comment
+) VALUES
+    (
+        'LIC-2026-0001',
+        (SELECT id FROM users WHERE username='padre'),
+        'guardian',
+        (SELECT id FROM students WHERE ru_code='RUDE-0001'),
+        (SELECT id FROM courses WHERE name='2do Secundaria A'),
+        'medical',
+        now() - interval '4 day',
+        now() - interval '2 day',
+        'Solicitud por reposo medico de un estudiante con certificado adjunto.',
+        'approved',
+        (SELECT id FROM users WHERE username='docente'),
+        now() - interval '3 day',
+        'Documentacion verificada y pre-dictamen favorable.',
+        (SELECT id FROM users WHERE username='rectora'),
+        now() - interval '2 day',
+        'Aprobada por direccion.'
+    ),
+    (
+        'LIC-2026-0002',
+        (SELECT id FROM users WHERE username='padre'),
+        'guardian',
+        (SELECT id FROM students WHERE ru_code='RUDE-0002'),
+        (SELECT id FROM courses WHERE name='1ro Secundaria A'),
+        'personal',
+        now() + interval '2 day',
+        now() + interval '3 day',
+        'Ausencia familiar programada con sustento documentado.',
+        'pending',
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL
+    ),
+    (
+        'LIC-2026-0003',
+        (SELECT id FROM users WHERE username='docente'),
+        'staff',
+        NULL,
+        (SELECT id FROM courses WHERE name='1ro Secundaria A'),
+        'institutional',
+        now() + interval '5 day',
+        now() + interval '5 day',
+        'Permiso institucional para actividad academica externa.',
+        'pre_approved',
+        (SELECT id FROM users WHERE username='docente'),
+        now() - interval '1 day',
+        'Se remite a direccion para decision final.',
+        NULL,
+        NULL,
+        NULL
+    )
+ON CONFLICT (tracking_code) DO NOTHING;
+
+-- Inasistencias iniciales para el panel del estudiante
+INSERT INTO student_absences (student_id, request_id, course_id, absence_date, reason, licensed, tracking_code)
+SELECT
+    s.id,
+    lr.id,
+    lr.course_id,
+    (date_trunc('day', lr.start_date) + (ofs || ' day')::interval)::date,
+    'Inasistencia justificada por licencia aprobada.',
+    true,
+    lr.tracking_code
+FROM leave_requests lr
+JOIN students s ON s.id = lr.student_id
+CROSS JOIN generate_series(0, 2) AS ofs
+WHERE lr.tracking_code = 'LIC-2026-0001'
+ON CONFLICT DO NOTHING;
+
+INSERT INTO student_absences (student_id, request_id, course_id, absence_date, reason, licensed, tracking_code)
+VALUES
+    ((SELECT id FROM students WHERE ru_code='RUDE-0001'), NULL, (SELECT id FROM courses WHERE name='2do Secundaria A'), CURRENT_DATE - 7, 'Inasistencia no justificada por retraso de reporte.', false, NULL),
+    ((SELECT id FROM students WHERE ru_code='RUDE-0002'), NULL, (SELECT id FROM courses WHERE name='1ro Secundaria A'), CURRENT_DATE - 3, 'Falta sin aviso previo.', false, NULL)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO student_guardians (student_id, guardian_id, relationship, is_primary) VALUES
+    ((SELECT s.id FROM students s JOIN users u ON u.id=s.user_id WHERE u.username='estudiante'),
+     (SELECT g.id FROM guardians g JOIN users u ON u.id=g.user_id WHERE u.username='padre'), 'Madre', true),
+    ((SELECT s.id FROM students s JOIN users u ON u.id=s.user_id WHERE u.username='estudiante2'),
+     (SELECT g.id FROM guardians g JOIN users u ON u.id=g.user_id WHERE u.username='padre'), 'Madre', true)
+ON CONFLICT DO NOTHING;
+
+-- Docente asignado a 2 cursos (2do Sec A y 1ro Sec A)
+INSERT INTO course_reviewers (course_id, reviewer_id) VALUES
+    ((SELECT id FROM courses WHERE name='2do Secundaria A'), (SELECT id FROM users WHERE username='docente')),
+    ((SELECT id FROM courses WHERE name='1ro Secundaria A'),  (SELECT id FROM users WHERE username='docente'))
+ON CONFLICT DO NOTHING;
+
+-- Permiso de ejemplo: el padre solicita para su hija estudiante
+INSERT INTO leave_requests (
+    tracking_code, applicant_id, applicant_kind, student_id, course_id,
+    request_type, start_date, end_date, reason, status, created_at
+) VALUES (
+    'LIC-2026-0007',
+    (SELECT id FROM users WHERE username='padre'),
+    'guardian',
+    (SELECT s.id FROM students s JOIN users u ON u.id=s.user_id WHERE u.username='estudiante'),
+    (SELECT id FROM courses WHERE name='2do Secundaria A'),
+    'medical',
+    now() - interval '2 days',
+    now() - interval '1 day',
+    'Reposo medico por gripe estacional, certificado adjunto.',
+    'pending',
+    now() - interval '1 day'
+)
+ON CONFLICT (tracking_code) DO NOTHING;
 
 -- ============================================================================
 --  FIN DEL SCRIPT

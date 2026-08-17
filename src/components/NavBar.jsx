@@ -10,17 +10,17 @@ export function NavBar() {
     <header className="lnav">
       <div className="lnav-inner">
         <Link to="/" className="lnav-brand">
-          <span className="crest">U</span>
+          <span className="crest">DB</span>
           <span className="lnav-brand-name">
-            U.E. <strong>Mariscal Santa Cruz</strong>
+            U.E. <strong>Don Bosco</strong>
           </span>
         </Link>
 
         <nav className="lnav-links">
           <Link to="/">Inicio</Link>
-          <a href="#/#servicios">Servicios</a>
+          <Link to="/servicios">Servicios</Link>
           <a href="#/#contacto">Contacto</a>
-          <Link to="/permisos">Solicitar permiso</Link>
+          {user && (user.role === 'parent' || user.role === 'admin') && <Link to="/permisos">Solicitar permiso</Link>}
         </nav>
 
         <div className="lnav-user">
@@ -49,6 +49,11 @@ export function NavBar() {
                   Panel
                 </Link>
               )}
+              {(user.role === 'parent' || user.role === 'admin') && (
+                <Link to="/permisos" className="btn primary" style={{ marginLeft: 8 }}>
+                  Solicitar permiso
+                </Link>
+              )}
               <button
                 className="btn ghost"
                 onClick={() => {
@@ -61,11 +66,8 @@ export function NavBar() {
             </>
           ) : (
             <>
-              <Link to="/login" className="btn ghost">
+              <Link to="/login" className="btn primary">
                 Iniciar sesion
-              </Link>
-              <Link to="/permisos" className="btn primary">
-                Solicitar permiso
               </Link>
             </>
           )}
