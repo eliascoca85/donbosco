@@ -18,11 +18,8 @@ export async function updateGuardian(id, payload) {
   })
 }
 
-export async function deleteGuardian(id, { mode = 'deactivate' } = {}) {
-  return apiRequest(`/admin/guardians/${id}`, {
-    method: 'DELETE',
-    body: { mode },
-  })
+export async function deactivateGuardian(id) {
+  return apiRequest(`/admin/guardians/${id}`, { method: 'DELETE' })
 }
 
 export async function createTeacher(payload) {
@@ -39,11 +36,8 @@ export async function updateTeacher(id, payload) {
   })
 }
 
-export async function deleteTeacher(id, { mode = 'deactivate' } = {}) {
-  return apiRequest(`/admin/teachers/${id}`, {
-    method: 'DELETE',
-    body: { mode },
-  })
+export async function deactivateTeacher(id) {
+  return apiRequest(`/admin/teachers/${id}`, { method: 'DELETE' })
 }
 
 export async function assignTeacherCourses(payload) {
@@ -72,5 +66,28 @@ export async function createStudent(payload) {
   return apiRequest('/teacher/students', {
     method: 'POST',
     body: payload,
+  })
+}
+export async function updateStudent(id, payload) {
+  return apiRequest(`/teacher/students/${id}`, {
+    method: 'PATCH',
+    body: payload,
+  })
+}
+
+export async function getTeacherGuardians() {
+  return apiRequest('/teacher/guardians')
+}
+
+export async function linkStudentGuardian(studentId, payload) {
+  return apiRequest(`/teacher/students/${studentId}/guardians`, {
+    method: 'POST',
+    body: payload,
+  })
+}
+
+export async function unlinkStudentGuardian(studentId, guardianId) {
+  return apiRequest(`/teacher/students/${studentId}/guardians/${guardianId}`, {
+    method: 'DELETE',
   })
 }

@@ -6,6 +6,7 @@ import express from 'express'
 import cors from 'cors'
 import jwt from 'jsonwebtoken'
 import { Pool } from 'pg'
+import { Buffer } from 'node:buffer'
 
 const PORT = Number(process.env.PORT || 4000)
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:5173'
@@ -44,6 +45,87 @@ async function query(text, params = []) {
   return pool.query(text, params)
 }
 
+// Ejecuta varias consultas como una sola operacion: si una falla, no queda nada a medias.
+async function withTransaction(fn) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await fn((text, params = []) => client.query(text, params))
+    await client.query('COMMIT')
+    return result
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+const UNIQUE_MESSAGES = {
+  users_username_key: 'Ese nombre de usuario ya esta registrado.',
+  users_email_key: 'Ese email ya esta registrado.',
+  guardians_ci_number_key: 'Ya existe un padre / tutor con ese CI.',
+  students_ru_code_key: 'Ese RUDE ya pertenece a otro estudiante.',
+  courses_name_key: 'Ya existe un curso con ese nombre.',
+}
+
+const LEAVE_TYPES = ['medical', 'personal', 'calamidad_domestica', 'institutional', 'other']
+const ATTACHMENT_TYPES = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp']
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
+const MAX_ATTACHMENTS = 3
+const DECIDABLE_STATUSES = ['pending', 'pre_approved', 'info_required']
+const RELATIONSHIPS = ['padre', 'madre', 'tutor legal']
+
+function parseIsoDate(value) {
+  const text = String(value || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null
+  return Number.isNaN(new Date(`${text}T00:00:00Z`).getTime()) ? null : text
+}
+
+function normalizeRelationship(value) {
+  const text = String(value || '').trim().toLowerCase()
+  return RELATIONSHIPS.includes(text) ? text : 'padre'
+}
+
+// Valida los adjuntos enviados como data URL (base64) desde el formulario.
+function parseAttachments(list) {
+  if (list == null) return []
+  if (!Array.isArray(list)) throw new HttpError(400, 'Adjuntos invalidos.')
+  if (list.length > MAX_ATTACHMENTS) throw new HttpError(400, `Puedes adjuntar como maximo ${MAX_ATTACHMENTS} archivos.`)
+  return list.map((item) => {
+    const fileName = String(item?.file_name || '').trim().slice(0, 180)
+    const dataUrl = String(item?.data_url || '')
+    const match = /^data:([\w/+.-]+);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl)
+    if (!fileName || !match) throw new HttpError(400, 'Un adjunto no se pudo leer. Vuelve a seleccionarlo.')
+    const fileType = match[1]
+    if (!ATTACHMENT_TYPES.includes(fileType)) {
+      throw new HttpError(400, `"${fileName}" no es PDF, JPG, PNG ni WEBP.`)
+    }
+    const fileSize = Buffer.byteLength(match[2], 'base64')
+    if (fileSize <= 0 || fileSize > MAX_ATTACHMENT_BYTES) {
+      throw new HttpError(400, `"${fileName}" supera el limite de 5 MB.`)
+    }
+    return { fileName, fileType, fileSize, dataUrl }
+  })
+}
+
+async function insertAttachments(run, requestId, userId, attachments) {
+  for (const att of attachments) {
+    await run(
+      `INSERT INTO request_attachments (request_id, uploaded_by, kind, storage_path, file_url, file_name, file_type, file_size)
+       VALUES ($1, $2, 'evidence', 'inline', $3, $4, $5, $6)`,
+      [requestId, userId, att.dataUrl, att.fileName, att.fileType, att.fileSize]
+    )
+  }
+}
+
 async function ensureSchema() {
   try {
     await query('SELECT 1 FROM roles LIMIT 1')
@@ -57,9 +139,9 @@ async function ensureSchema() {
 async function seedReferenceData() {
   await query(
     `INSERT INTO roles (name, description) VALUES
-      ('admin', 'Regente / Direccion - control total y gestion de credenciales'),
-      ('inspector', 'Inspectoria - acompanamiento y disciplina'),
-      ('teacher', 'Docente / Tutor - revisa permisos de sus cursos asignados'),
+      ('admin', 'Direccion - gestiona padres, docentes y decide permisos'),
+      ('inspector', 'Inspectoria - gestiona padres, docentes y decide permisos'),
+      ('teacher', 'Docente - registra estudiantes de sus cursos y los vincula con sus padres'),
       ('parent', 'Padre / Tutor - solicita permisos para sus hijos'),
       ('student', 'Estudiante - no solicita permisos, solo ve su panel de faltas')
     ON CONFLICT (name) DO NOTHING`
@@ -109,12 +191,56 @@ async function seedReferenceData() {
   await query(
     `INSERT INTO course_reviewers (course_id, reviewer_id) VALUES
       ((SELECT id FROM courses WHERE name='1ro Secundaria A'), (SELECT id FROM users WHERE username='docente')),
-      ((SELECT id FROM courses WHERE name='2do Secundaria A'), (SELECT id FROM users WHERE username='docente')),
-      ((SELECT id FROM courses WHERE name='3ro Secundaria A'), (SELECT id FROM users WHERE username='inspectoria')),
-      ((SELECT id FROM courses WHERE name='1ro Secundaria B'), (SELECT id FROM users WHERE username='rectora'))
+      ((SELECT id FROM courses WHERE name='2do Secundaria A'), (SELECT id FROM users WHERE username='docente'))
     ON CONFLICT (course_id, reviewer_id) DO NOTHING`
   )
 }
+
+const AUDIT_TRIGGER_SQL = `
+CREATE OR REPLACE FUNCTION fn_audit_leave_request()
+RETURNS trigger AS $fn$
+DECLARE
+    act audit_action;
+BEGIN
+    IF (TG_OP = 'INSERT') THEN
+        INSERT INTO audit_logs(actor_id, action, entity_type, entity_id, metadata)
+        VALUES (NEW.applicant_id, 'create', 'leave_requests', NEW.id::text,
+                jsonb_build_object('to', NEW.status, 'tracking_code', NEW.tracking_code));
+    ELSIF (TG_OP = 'DELETE') THEN
+        INSERT INTO audit_logs(actor_id, action, entity_type, entity_id, metadata)
+        VALUES (NULL, 'delete', 'leave_requests', OLD.id::text,
+                jsonb_build_object('tracking_code', OLD.tracking_code));
+        RETURN OLD;
+    ELSIF (TG_OP = 'UPDATE') THEN
+        IF OLD.status IS DISTINCT FROM NEW.status THEN
+            CASE NEW.status
+                WHEN 'pre_approved'  THEN act := 'pre_approve';
+                WHEN 'approved'      THEN act := 'approve';
+                WHEN 'rejected'      THEN act := 'reject';
+                WHEN 'info_required' THEN act := 'request_info';
+                ELSE act := 'update';
+            END CASE;
+            INSERT INTO audit_logs(actor_id, action, entity_type, entity_id, metadata)
+            VALUES (
+                CASE WHEN NEW.status IN ('pending', 'cancelled') THEN NEW.applicant_id
+                     WHEN NEW.status = 'pre_approved' THEN NEW.pre_reviewed_by
+                     ELSE NEW.reviewed_by END,
+                act,
+                'leave_requests',
+                NEW.id::text,
+                jsonb_build_object(
+                    'from', OLD.status,
+                    'to',   NEW.status,
+                    'comment', CASE WHEN NEW.status IN ('pending', 'cancelled') THEN NULL
+                                    WHEN NEW.status = 'pre_approved' THEN NEW.pre_review_comment
+                                    ELSE NEW.review_comment END
+                )
+            );
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql`
 
 async function ensureSupplementalSchema() {
   await query(
@@ -132,6 +258,7 @@ async function ensureSupplementalSchema() {
     )`
   )
 
+  await query('ALTER TABLE leave_requests ADD COLUMN IF NOT EXISTS resubmitted_at TIMESTAMPTZ')
   await query('CREATE INDEX IF NOT EXISTS idx_absences_student ON student_absences(student_id)')
   await query('CREATE INDEX IF NOT EXISTS idx_absences_date ON student_absences(absence_date DESC)')
   await query('CREATE INDEX IF NOT EXISTS idx_absences_request ON student_absences(request_id)')
@@ -140,6 +267,15 @@ async function ensureSupplementalSchema() {
     `CREATE TRIGGER trg_absences_updated_at BEFORE UPDATE ON student_absences
      FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at()`
   )
+
+  // Solo los docentes acompanan cursos; Direccion e Inspectoria ya ven todo.
+  await query(
+    `DELETE FROM course_reviewers cr USING users u, roles r
+     WHERE u.id = cr.reviewer_id AND r.id = u.role_id AND r.name <> 'teacher'`
+  )
+
+  // La version original no registraba la creacion y atribuia el reenvio del padre al revisor.
+  await query(AUDIT_TRIGGER_SQL)
 
   const count = await query('SELECT COUNT(*)::int AS count FROM student_absences')
   if (count.rows[0].count > 0) return
@@ -198,24 +334,6 @@ async function seedDemoRequests() {
         NULL,
         NULL,
         NULL
-      ),
-      (
-        'LIC-2026-0003',
-        (SELECT id FROM users WHERE username='docente'),
-        'staff',
-        NULL,
-        (SELECT id FROM courses WHERE name='1ro Secundaria A'),
-        'institutional',
-        now() + interval '5 day',
-        now() + interval '5 day',
-        'Permiso institucional para actividad academica externa.',
-        'pre_approved',
-        (SELECT id FROM users WHERE username='docente'),
-        now() - interval '1 day',
-        'Se remite a direccion para decision final.',
-        NULL,
-        NULL,
-        NULL
       )
     ON CONFLICT (tracking_code) DO NOTHING`
   )
@@ -270,6 +388,7 @@ async function getPublicUserById(userId) {
       u.name,
       u.email,
       u.phone,
+      u.status,
       r.name AS role_name,
       c.name AS student_course,
       tc.assigned_courses,
@@ -296,7 +415,7 @@ async function getPublicUserById(userId) {
        JOIN students s2 ON s2.id = sg.student_id
        JOIN users u2 ON u2.id = s2.user_id
        LEFT JOIN courses c2 ON c2.id = s2.course_id
-       WHERE sg.guardian_id = g.id
+       WHERE sg.guardian_id = g.id AND s2.status = 'active'
      ) pc ON true
      WHERE u.id = $1`,
     [userId]
@@ -331,20 +450,28 @@ async function getPublicUserById(userId) {
     assignedCourses,
     linkedStudents,
     initials: initialsOf(row.name),
+    active: row.status === 'active',
   }
 }
 
 async function authMiddleware(req, res, next) {
+  const token = getToken(req)
+  if (!token) return res.status(401).json({ error: 'No autenticado.' })
+  let payload
   try {
-    const token = getToken(req)
-    if (!token) return res.status(401).json({ error: 'No autenticado.' })
-    const payload = jwt.verify(token, JWT_SECRET)
+    payload = jwt.verify(token, JWT_SECRET)
+  } catch {
+    return res.status(401).json({ error: 'Tu sesion expiro. Vuelve a ingresar.' })
+  }
+  // Un fallo de la base de datos es un 500, no una sesion invalida: no debe cerrar la sesion del usuario.
+  try {
     const user = await getPublicUserById(payload.sub)
     if (!user) return res.status(401).json({ error: 'Sesion invalida.' })
+    if (!user.active) return res.status(401).json({ error: 'Tu cuenta esta desactivada. Comunicate con la direccion.' })
     req.user = user
     next()
-  } catch {
-    return res.status(401).json({ error: 'Sesion invalida.' })
+  } catch (error) {
+    next(error)
   }
 }
 
@@ -358,16 +485,10 @@ function requireRole(...allowed) {
   }
 }
 
-function buildEvents(row) {
-  const events = [
-    {
-      kind: 'created',
-      label: `Solicitud creada por ${row.applicant_name}`,
-      at: row.created_at,
-      note: null,
-      actor: row.applicant_name,
-    },
-  ]
+// Eventos a partir de las columnas actuales; solo se usa si la solicitud no tiene historial en audit_logs
+// (por ejemplo, las solicitudes demo insertadas antes de corregir el trigger).
+function buildEventsFromRow(row) {
+  const events = []
   if (row.pre_review_comment) {
     events.push({
       kind: 'pre_approved',
@@ -377,31 +498,73 @@ function buildEvents(row) {
       actor: row.pre_reviewed_by_name,
     })
   }
-  if (row.review_comment && (row.status === 'approved' || row.status === 'rejected')) {
+  if (row.reviewed_at && (row.status === 'approved' || row.status === 'rejected')) {
     events.push({
       kind: row.status,
-      label: row.status === 'approved' ? 'Licencia aprobada' : 'Licencia rechazada',
+      label: `${row.status === 'approved' ? 'Permiso aprobado' : 'Permiso rechazado'} por ${row.reviewed_by_name || 'direccion'}`,
       at: row.reviewed_at,
-      note: row.review_comment,
+      note: row.review_comment || null,
       actor: row.reviewed_by_name,
     })
   }
-  if (row.status === 'info_required' && row.review_comment) {
+  if (row.reviewed_at && row.status !== 'approved' && row.status !== 'rejected' && row.review_comment) {
     events.push({
       kind: 'info_required',
-      label: 'Se solicito correccion / mas informacion',
+      label: `Correccion solicitada por ${row.reviewed_by_name || 'direccion'}`,
       at: row.reviewed_at,
       note: row.review_comment,
       actor: row.reviewed_by_name,
     })
+    if (row.status === 'pending' && row.resubmitted_at) {
+      events.push({
+        kind: 'created',
+        label: 'Solicitud corregida y reenviada',
+        at: row.resubmitted_at,
+        note: null,
+        actor: row.applicant_name,
+      })
+    }
   }
-  return events.sort((a, b) => new Date(a.at) - new Date(b.at))
+  return events
 }
 
-function serializeRequest(row, attachments = []) {
+function eventFromLog(log, row) {
+  const to = log.metadata?.to
+  const note = log.metadata?.comment || null
+  const who = log.actor_name || 'direccion'
+  if (to === 'approved') return { kind: 'approved', label: `Permiso aprobado por ${who}`, at: log.created_at, note, actor: log.actor_name }
+  if (to === 'rejected') return { kind: 'rejected', label: `Permiso rechazado por ${who}`, at: log.created_at, note, actor: log.actor_name }
+  if (to === 'info_required') {
+    return { kind: 'info_required', label: `Correccion solicitada por ${who}`, at: log.created_at, note, actor: log.actor_name }
+  }
+  if (to === 'pre_approved') return { kind: 'pre_approved', label: 'Pre-dictamen emitido', at: log.created_at, note, actor: log.actor_name }
+  if (to === 'pending' && log.metadata?.from === 'info_required') {
+    return { kind: 'created', label: 'Solicitud corregida y reenviada', at: log.created_at, note: null, actor: row.applicant_name }
+  }
+  if (to === 'cancelled') return { kind: 'rejected', label: 'Solicitud anulada', at: log.created_at, note, actor: log.actor_name }
+  return null
+}
+
+function buildEvents(row, history = []) {
+  const created = {
+    kind: 'created',
+    label: `Solicitud creada por ${row.applicant_name}`,
+    at: row.created_at,
+    note: null,
+    actor: row.applicant_name,
+  }
+  const transitions = history.filter((log) => log.action !== 'create' && log.action !== 'delete')
+  const rest = transitions.length
+    ? transitions.map((log) => eventFromLog(log, row)).filter(Boolean)
+    : buildEventsFromRow(row)
+  return [created, ...rest].sort((a, b) => new Date(a.at) - new Date(b.at))
+}
+
+function serializeRequest(row, attachments = [], history = []) {
   return {
     id: row.id,
     tracking_code: row.tracking_code,
+    student_name: row.student_name || null,
     applicant: {
       name: row.applicant_name,
       kind: row.applicant_kind,
@@ -410,6 +573,7 @@ function serializeRequest(row, attachments = []) {
       phone: row.applicant_phone || '—',
     },
     applicant_kind: row.applicant_kind,
+    applicant_id: row.applicant_id,
     course: row.course_name || '—',
     course_id: row.course_id,
     student_id: row.student_id,
@@ -427,11 +591,11 @@ function serializeRequest(row, attachments = []) {
     review_comment: row.review_comment,
     attachments,
     initials: initialsOf(row.applicant_name),
-    events: buildEvents(row),
+    events: buildEvents(row, history),
   }
 }
 
-async function getRequestRowsForUser(user) {
+async function getRequestRowsForUser(user, onlyId = null) {
   const baseSql = `
     SELECT
       lr.*,
@@ -439,11 +603,14 @@ async function getRequestRowsForUser(user) {
       applicant.email AS applicant_email,
       applicant.phone AS applicant_phone,
       course.name AS course_name,
+      student_user.name AS student_name,
       pre_u.name AS pre_reviewed_by_name,
       review_u.name AS reviewed_by_name
     FROM leave_requests lr
     JOIN users applicant ON applicant.id = lr.applicant_id
     LEFT JOIN courses course ON course.id = lr.course_id
+    LEFT JOIN students st ON st.id = lr.student_id
+    LEFT JOIN users student_user ON student_user.id = st.user_id
     LEFT JOIN users pre_u ON pre_u.id = lr.pre_reviewed_by
     LEFT JOIN users review_u ON review_u.id = lr.reviewed_by
     WHERE lr.deleted_at IS NULL
@@ -477,13 +644,17 @@ async function getRequestRowsForUser(user) {
     )`
   }
 
+  if (onlyId) {
+    params.push(onlyId)
+    sql += ` AND lr.id = $${params.length}`
+  }
   sql += ' ORDER BY lr.created_at DESC'
   const { rows } = await query(sql, params)
   const requestIds = rows.map((row) => row.id)
   const attachmentMap = new Map()
   if (requestIds.length > 0) {
     const { rows: attachments } = await query(
-      `SELECT id, request_id, file_name, file_type, file_size, kind, file_url
+      `SELECT id, request_id, file_name, file_type, file_size, kind
        FROM request_attachments
        WHERE request_id = ANY($1::uuid[])`,
       [requestIds]
@@ -492,6 +663,23 @@ async function getRequestRowsForUser(user) {
       const current = attachmentMap.get(attachment.request_id) || []
       current.push(attachment)
       attachmentMap.set(attachment.request_id, current)
+    }
+  }
+  // Historial completo de cambios de estado: cada correccion y decision conserva su comentario.
+  const historyMap = new Map()
+  if (requestIds.length > 0) {
+    const { rows: logs } = await query(
+      `SELECT al.entity_id, al.action, al.metadata, al.created_at, u.name AS actor_name
+       FROM audit_logs al
+       LEFT JOIN users u ON u.id = al.actor_id
+       WHERE al.entity_type = 'leave_requests' AND al.entity_id = ANY($1::text[])
+       ORDER BY al.created_at, al.id`,
+      [requestIds.map(String)]
+    )
+    for (const log of logs) {
+      const current = historyMap.get(log.entity_id) || []
+      current.push(log)
+      historyMap.set(log.entity_id, current)
     }
   }
   return rows.map((row) =>
@@ -503,32 +691,35 @@ async function getRequestRowsForUser(user) {
         file_type: attachment.file_type,
         file_size: Number(attachment.file_size),
         kind: attachment.kind,
-        file_url: attachment.file_url,
-      }))
+      })),
+      historyMap.get(String(row.id)) || []
     )
   )
 }
 
-async function createAbsencesFromRequest(requestId) {
-  const { rows } = await query(
-    `SELECT lr.*, s.id AS student_row_id
+// Al aprobar un permiso, cada dia habil del periodo queda como falta justificada.
+// Si ya existia una falta sin licencia ese dia, se marca como justificada en lugar de duplicarla.
+async function createAbsencesFromRequest(run, requestId) {
+  const { rows } = await run(
+    `SELECT lr.id, lr.student_id, lr.course_id, lr.tracking_code, d::date AS day
      FROM leave_requests lr
-     JOIN students s ON s.id = lr.student_id
-     WHERE lr.id = $1`,
+     CROSS JOIN LATERAL generate_series(lr.start_date::date, lr.end_date::date, interval '1 day') AS d
+     WHERE lr.id = $1 AND lr.status = 'approved' AND lr.student_id IS NOT NULL
+       AND EXTRACT(ISODOW FROM d) < 6`,
     [requestId]
   )
-  const request = rows[0]
-  if (!request || !request.student_row_id || request.status !== 'approved') return
-
-  const start = new Date(request.start_date)
-  const end = new Date(request.end_date)
-  for (let cursor = new Date(start); cursor <= end; cursor.setDate(cursor.getDate() + 1)) {
-    const iso = cursor.toISOString().slice(0, 10)
-    await query(
+  for (const row of rows) {
+    const updated = await run(
+      `UPDATE student_absences
+       SET licensed = true, request_id = $2, tracking_code = $3, reason = $4
+       WHERE student_id = $1 AND absence_date = $5`,
+      [row.student_id, row.id, row.tracking_code, 'Inasistencia justificada por licencia aprobada.', row.day]
+    )
+    if (updated.rowCount > 0) continue
+    await run(
       `INSERT INTO student_absences (student_id, request_id, course_id, absence_date, reason, licensed, tracking_code)
-       VALUES ($1, $2, $3, $4, $5, true, $6)
-       ON CONFLICT DO NOTHING`,
-      [request.student_row_id, request.id, request.course_id, iso, 'Inasistencia justificada por licencia aprobada.', request.tracking_code]
+       VALUES ($1, $2, $3, $4, $5, true, $6)`,
+      [row.student_id, row.id, row.course_id, row.day, 'Inasistencia justificada por licencia aprobada.', row.tracking_code]
     )
   }
 }
@@ -593,6 +784,7 @@ async function getManagementData() {
         u.name,
         u.email,
         u.phone,
+        c.id AS course_id,
         c.name AS course_name
        FROM students s
        LEFT JOIN users u ON u.id = s.user_id
@@ -609,7 +801,7 @@ async function getManagementData() {
         u.email,
         u.phone,
         u.status,
-        COALESCE(json_agg(json_build_object('id', s.id, 'name', su.name, 'course', c.name) ORDER BY su.name) FILTER (WHERE s.id IS NOT NULL), '[]'::json) AS children
+        COALESCE(json_agg(json_build_object('id', s.id, 'name', su.name, 'course', c.name, 'relationship', sg.relationship) ORDER BY su.name) FILTER (WHERE s.id IS NOT NULL), '[]'::json) AS children
        FROM guardians g
        LEFT JOIN users u ON u.id = g.user_id
        LEFT JOIN student_guardians sg ON sg.guardian_id = g.id
@@ -648,7 +840,11 @@ async function getManagementData() {
 
 const app = express()
 app.use(cors({ origin: CLIENT_ORIGIN, credentials: true }))
-app.use(express.json({ limit: '10mb' }))
+// Los adjuntos viajan en base64 (hasta 3 x 5 MB), por eso el limite es mayor al habitual.
+app.use(express.json({ limit: '25mb' }))
+
+// Direccion e inspectoria comparten las mismas atribuciones de gestion.
+const MANAGERS = ['admin', 'inspector']
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'bosco-api' })
@@ -662,19 +858,21 @@ app.post('/api/auth/login', async (req, res) => {
   }
 
   const { rows } = await query(
-    `SELECT u.id
+    `SELECT u.id, u.status
      FROM users u
      WHERE lower(u.username) = lower($1)
-       AND u.password_hash = crypt($2, u.password_hash)
-       AND u.status = 'active'`,
+       AND u.password_hash = crypt($2, u.password_hash)`,
     [username, password]
   )
 
-  const userId = rows[0]?.id
-  if (!userId) return res.status(401).json({ error: 'Usuario o contrasena incorrectos.' })
+  const found = rows[0]
+  if (!found) return res.status(401).json({ error: 'Usuario o contrasena incorrectos.' })
+  if (found.status !== 'active') {
+    return res.status(403).json({ error: 'Tu cuenta esta desactivada. Comunicate con la direccion.' })
+  }
 
-  const user = await getPublicUserById(userId)
-  const token = signToken(userId)
+  const user = await getPublicUserById(found.id)
+  const token = signToken(found.id)
   return res.json({ token, user })
 })
 
@@ -691,113 +889,164 @@ app.get('/api/leave-requests', authMiddleware, async (req, res) => {
   res.json({ items: rows })
 })
 
-app.post('/api/leave-requests', authMiddleware, requireRole('parent', 'admin'), async (req, res) => {
-  const payload = req.body || {}
-  const studentId = String(payload.student_id || '').trim()
-  const requestType = String(payload.request_type || 'personal')
-  const startDate = String(payload.start_date || '').trim()
-  const endDate = String(payload.end_date || '').trim()
+function readLeavePayload(payload) {
+  const requestType = String(payload.request_type || '')
+  const startDate = parseIsoDate(payload.start_date)
+  const endDate = parseIsoDate(payload.end_date)
   const reason = String(payload.reason || '').trim()
 
-  if (!studentId) {
-    return res.status(400).json({ error: 'Debes seleccionar un estudiante.' })
-  }
-  if (!startDate || !endDate || !reason) {
-    return res.status(400).json({ error: 'Faltan campos obligatorios.' })
-  }
+  if (!LEAVE_TYPES.includes(requestType)) throw new HttpError(400, 'Selecciona un tipo de permiso valido.')
+  if (!startDate || !endDate) throw new HttpError(400, 'Indica la fecha de inicio y de fin.')
+  if (endDate < startDate) throw new HttpError(400, 'La fecha de fin no puede ser anterior a la de inicio.')
+  if (reason.length < 10) throw new HttpError(400, 'Describe el motivo con al menos 10 caracteres.')
+  return { requestType, startDate, endDate, reason }
+}
 
-  const studentQuery = await query(
-    `SELECT s.id, s.course_id, su.name, su.email
+// Evita dos permisos abiertos o aprobados para el mismo estudiante en fechas que se cruzan.
+async function assertNoOverlap(run, studentId, startDate, endDate, exceptId = null) {
+  const { rows } = await run(
+    `SELECT tracking_code FROM leave_requests
+     WHERE student_id = $1 AND deleted_at IS NULL
+       AND status IN ('pending', 'pre_approved', 'info_required', 'approved')
+       AND start_date::date <= $3::date AND end_date::date >= $2::date
+       AND ($4::uuid IS NULL OR id <> $4::uuid)
+     LIMIT 1`,
+    [studentId, startDate, endDate, exceptId]
+  )
+  if (rows[0]) {
+    throw new HttpError(409, `Ya existe el permiso ${rows[0].tracking_code} para esas fechas. Revisa "Mis solicitudes".`)
+  }
+}
+
+// Solo los padres / tutores solicitan permisos, y solo para estudiantes vinculados a ellos.
+app.post('/api/leave-requests', authMiddleware, requireRole('parent'), async (req, res) => {
+  const payload = req.body || {}
+  const studentId = String(payload.student_id || '').trim()
+  if (!studentId) return res.status(400).json({ error: 'Selecciona el estudiante para quien pides el permiso.' })
+  const { requestType, startDate, endDate, reason } = readLeavePayload(payload)
+  const attachments = parseAttachments(payload.attachments)
+
+  const link = await query(
+    `SELECT s.id, s.course_id, s.status
      FROM students s
-     JOIN users su ON su.id = s.user_id
-     WHERE s.id = $1`,
-    [studentId]
+     JOIN student_guardians sg ON sg.student_id = s.id
+     JOIN guardians g ON g.id = sg.guardian_id
+     WHERE s.id = $1 AND g.user_id = $2`,
+    [studentId, req.user.id]
   )
-  const student = studentQuery.rows[0]
-  if (!student) {
-    return res.status(404).json({ error: 'Estudiante no encontrado.' })
+  const student = link.rows[0]
+  if (!student) return res.status(403).json({ error: 'Ese estudiante no esta vinculado a tu cuenta.' })
+  if (student.status !== 'active') {
+    return res.status(409).json({ error: 'El estudiante figura como retirado; comunicate con su profesor de curso.' })
   }
+  await assertNoOverlap(query, student.id, startDate, endDate)
 
-  if (req.user.role === 'parent') {
-    const guardianQuery = await query('SELECT id FROM guardians WHERE user_id = $1', [req.user.id])
-    const guardian = guardianQuery.rows[0]
-    const linkQuery = await query(
-      `SELECT 1
-       FROM student_guardians
-       WHERE guardian_id = $1 AND student_id = $2`,
-      [guardian?.id, studentId]
+  const requestId = await withTransaction(async (run) => {
+    const insert = await run(
+      `INSERT INTO leave_requests (
+        applicant_id, applicant_kind, student_id, course_id, request_type,
+        start_date, end_date, reason, status
+      ) VALUES ($1, 'guardian', $2, $3, $4, $5, $6, $7, 'pending')
+      RETURNING id`,
+      [req.user.id, student.id, student.course_id, requestType, `${startDate}T00:00:00`, `${endDate}T23:59:59`, reason]
     )
-    if (!guardian || linkQuery.rowCount === 0) {
-      return res.status(403).json({ error: 'No tienes vinculacion con ese estudiante.' })
-    }
-  }
+    const id = insert.rows[0].id
+    await insertAttachments(run, id, req.user.id, attachments)
+    return id
+  })
 
-  const applicantKind = req.user.role === 'parent' ? 'guardian' : 'staff'
-  const insert = await query(
-    `INSERT INTO leave_requests (
-      applicant_id, applicant_kind, student_id, course_id, request_type,
-      start_date, end_date, reason, status
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-    RETURNING id`,
-    [req.user.id, applicantKind, studentId, student.course_id, requestType, `${startDate}T00:00:00`, `${endDate}T23:59:59`, reason]
-  )
-
-  const requestId = insert.rows[0].id
-  const createdRows = await getRequestRowsForUser(req.user)
-  const createdRequest = createdRows.find((row) => row.id === requestId)
-  res.status(201).json({ item: createdRequest || null })
+  const [created] = await getRequestRowsForUser(req.user, requestId)
+  res.status(201).json({ item: created || null })
 })
 
-app.patch('/api/leave-requests/:id/status', authMiddleware, requireRole('teacher', 'inspector', 'admin'), async (req, res) => {
-  const id = req.params.id
-  const nextStatus = String(req.body?.status || '')
-  const comment = String(req.body?.comment || '').trim()
+// El padre corrige una solicitud devuelta por direccion / inspectoria y la reenvia a revision.
+app.patch('/api/leave-requests/:id', authMiddleware, requireRole('parent'), async (req, res) => {
+  const id = String(req.params.id)
+  const payload = req.body || {}
+  const { requestType, startDate, endDate, reason } = readLeavePayload(payload)
+  const attachments = parseAttachments(payload.attachments)
 
   const { rows } = await query(
-    `SELECT lr.*, c.name AS course_name
-     FROM leave_requests lr
-     LEFT JOIN courses c ON c.id = lr.course_id
-     WHERE lr.id = $1`,
-    [id]
+    `SELECT id, status, student_id FROM leave_requests WHERE id = $1 AND applicant_id = $2 AND deleted_at IS NULL`,
+    [id, req.user.id]
   )
   const current = rows[0]
   if (!current) return res.status(404).json({ error: 'Solicitud no encontrada.' })
+  if (current.status !== 'info_required') {
+    return res.status(409).json({ error: 'Solo puedes corregir solicitudes a las que se pidio correccion.' })
+  }
+  if (current.student_id) await assertNoOverlap(query, current.student_id, startDate, endDate, id)
 
-  const assignedCourse = await query(
-    `SELECT 1 FROM course_reviewers WHERE reviewer_id = $1 AND course_id = $2`,
-    [req.user.id, current.course_id]
+  await withTransaction(async (run) => {
+    await run(
+      `UPDATE leave_requests
+       SET request_type = $2, start_date = $3, end_date = $4, reason = $5,
+           status = 'pending', resubmitted_at = now()
+       WHERE id = $1`,
+      [id, requestType, `${startDate}T00:00:00`, `${endDate}T23:59:59`, reason]
+    )
+    const existing = await run('SELECT COUNT(*)::int AS count FROM request_attachments WHERE request_id = $1', [id])
+    if (existing.rows[0].count + attachments.length > MAX_ATTACHMENTS) {
+      throw new HttpError(400, `La solicitud ya tiene adjuntos; el maximo es ${MAX_ATTACHMENTS}.`)
+    }
+    await insertAttachments(run, id, req.user.id, attachments)
+  })
+
+  const [updated] = await getRequestRowsForUser(req.user, id)
+  res.json({ item: updated || null })
+})
+
+// Decision sobre un permiso: solo direccion e inspectoria.
+// approved / rejected cierran el expediente; info_required lo devuelve al padre para corregir.
+app.patch('/api/leave-requests/:id/status', authMiddleware, requireRole(...MANAGERS), async (req, res) => {
+  const id = String(req.params.id)
+  const nextStatus = String(req.body?.status || '')
+  const comment = String(req.body?.comment || '').trim()
+
+  if (!['approved', 'rejected', 'info_required'].includes(nextStatus)) {
+    return res.status(400).json({ error: 'Decision no valida.' })
+  }
+  if ((nextStatus === 'rejected' || nextStatus === 'info_required') && !comment) {
+    return res.status(400).json({ error: 'Indica el motivo para el padre / tutor.' })
+  }
+
+  await withTransaction(async (run) => {
+    const { rows } = await run(
+      'SELECT id, status FROM leave_requests WHERE id = $1 AND deleted_at IS NULL FOR UPDATE',
+      [id]
+    )
+    const current = rows[0]
+    if (!current) throw new HttpError(404, 'Solicitud no encontrada.')
+    if (!DECIDABLE_STATUSES.includes(current.status)) {
+      throw new HttpError(409, 'Esta solicitud ya fue cerrada y no admite otra decision.')
+    }
+    if (nextStatus === 'info_required' && current.status === 'info_required') {
+      throw new HttpError(409, 'Ya se pidio una correccion; espera a que el padre / tutor la reenvie.')
+    }
+
+    await run(
+      `UPDATE leave_requests
+       SET status = $2, reviewed_by = $3, reviewed_at = now(), review_comment = $4
+       WHERE id = $1`,
+      [id, nextStatus, req.user.id, comment || null]
+    )
+    if (nextStatus === 'approved') await createAbsencesFromRequest(run, id)
+  })
+
+  const [refreshed] = await getRequestRowsForUser(req.user, id)
+  res.json({ item: refreshed || null })
+})
+
+// Descarga de un adjunto; solo para quien puede ver la solicitud.
+app.get('/api/leave-requests/:id/attachments/:attachmentId', authMiddleware, async (req, res) => {
+  const [visible] = await getRequestRowsForUser(req.user, String(req.params.id))
+  if (!visible) return res.status(404).json({ error: 'Solicitud no encontrada.' })
+  const { rows } = await query(
+    'SELECT id, file_name, file_type, file_size, file_url FROM request_attachments WHERE id = $1 AND request_id = $2',
+    [String(req.params.attachmentId), visible.id]
   )
-  const isAssignedTeacher = req.user.role === 'teacher' && assignedCourse.rowCount > 0
-  const canAccess = req.user.role === 'admin' || req.user.role === 'inspector' || isAssignedTeacher
-  if (!canAccess) return res.status(403).json({ error: 'No puedes gestionar esta solicitud.' })
-
-  const allowedByRole =
-    req.user.role === 'admin'
-      ? ['pre_approved', 'approved', 'rejected', 'info_required']
-      : req.user.role === 'inspector'
-      ? ['pre_approved', 'rejected', 'info_required']
-      : ['pre_approved', 'info_required']
-  if (!allowedByRole.includes(nextStatus)) {
-    return res.status(403).json({ error: 'Transicion no permitida para tu rol.' })
-  }
-
-  const updates = {
-    pre_approved: { sql: 'UPDATE leave_requests SET status = $2, pre_reviewed_by = $3, pre_review_at = now(), pre_review_comment = $4 WHERE id = $1 RETURNING id', fields: [id, nextStatus, req.user.id, comment] },
-    approved: { sql: 'UPDATE leave_requests SET status = $2, reviewed_by = $3, reviewed_at = now(), review_comment = $4 WHERE id = $1 RETURNING id', fields: [id, nextStatus, req.user.id, comment] },
-    rejected: { sql: 'UPDATE leave_requests SET status = $2, reviewed_by = $3, reviewed_at = now(), review_comment = $4 WHERE id = $1 RETURNING id', fields: [id, nextStatus, req.user.id, comment] },
-    info_required: { sql: 'UPDATE leave_requests SET status = $2, reviewed_by = $3, reviewed_at = now(), review_comment = $4 WHERE id = $1 RETURNING id', fields: [id, nextStatus, req.user.id, comment] },
-  }
-
-  const update = updates[nextStatus]
-  if (!update) return res.status(400).json({ error: 'Estado no soportado.' })
-  await query(update.sql, update.fields)
-
-  if (nextStatus === 'approved') {
-    await createAbsencesFromRequest(id)
-  }
-
-  const refreshed = await getRequestRowsForUser(req.user)
-  res.json({ item: refreshed.find((row) => row.id === id) || null })
+  if (!rows[0]) return res.status(404).json({ error: 'Adjunto no encontrado.' })
+  res.json({ item: { ...rows[0], file_size: Number(rows[0].file_size) } })
 })
 
 app.get('/api/absences/me', authMiddleware, async (req, res) => {
@@ -805,378 +1054,294 @@ app.get('/api/absences/me', authMiddleware, async (req, res) => {
   res.json({ items })
 })
 
-app.get('/api/admin/management', authMiddleware, requireRole('admin'), async (_req, res) => {
+/* ------------------------------------------------------------------ */
+/* Gestion institucional (direccion e inspectoria)                     */
+/* ------------------------------------------------------------------ */
+
+app.get('/api/admin/management', authMiddleware, requireRole(...MANAGERS), async (_req, res) => {
   const data = await getManagementData()
   res.json(data)
 })
 
-app.post('/api/admin/guardians', authMiddleware, requireRole('admin'), async (req, res) => {
-  const payload = req.body || {}
-  const username = String(payload.username || '').trim()
-  const name = String(payload.name || '').trim()
-  const email = String(payload.email || '').trim()
-  const password = String(payload.password || '').trim()
-  const phone = String(payload.phone || '').trim() || null
-  const ciNumber = String(payload.ci_number || '').trim()
-  const studentIds = Array.isArray(payload.student_ids) ? payload.student_ids.filter(Boolean) : []
-  const relationship = String(payload.relationship || 'padre').trim() || 'padre'
-
-  if (!username || !name || !email || !password || !ciNumber || studentIds.length === 0) {
-    return res.status(400).json({ error: 'Completa todos los campos y selecciona al menos un estudiante.' })
+function readPerson(payload, { requirePassword }) {
+  const person = {
+    username: String(payload.username || '').trim().toLowerCase(),
+    name: String(payload.name || '').trim(),
+    email: String(payload.email || '').trim(),
+    password: String(payload.password || ''),
+    phone: String(payload.phone ?? '').trim() || null,
   }
+  if (person.username.length < 3) throw new HttpError(400, 'El usuario debe tener al menos 3 caracteres.')
+  if (!/^[a-z0-9._-]+$/.test(person.username)) {
+    throw new HttpError(400, 'El usuario solo admite letras, numeros, punto, guion y guion bajo.')
+  }
+  if (person.name.length < 3) throw new HttpError(400, 'Escribe el nombre completo.')
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(person.email)) throw new HttpError(400, 'El email no es valido.')
+  if (person.phone && !/^\+?[0-9\-\s]{6,20}$/.test(person.phone)) {
+    throw new HttpError(400, 'El telefono solo admite numeros, espacios y guiones.')
+  }
+  if (requirePassword && person.password.length < 6) {
+    throw new HttpError(400, 'La contrasena inicial debe tener al menos 6 caracteres.')
+  }
+  if (!requirePassword && person.password && person.password.length < 6) {
+    throw new HttpError(400, 'La nueva contrasena debe tener al menos 6 caracteres.')
+  }
+  return person
+}
 
-  const roleId = (await query(`SELECT id FROM roles WHERE name = 'parent'`)).rows[0]?.id
-  const userResult = await query(
-    `INSERT INTO users (username, name, email, password_hash, role_id, phone)
-     VALUES ($1, $2, $3, crypt($4, gen_salt('bf')), $5, $6)
-     ON CONFLICT (username)
-     DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash, updated_at = now()
-     RETURNING id`,
-    [username, name, email, password, roleId, phone]
-  )
-  const userId = userResult.rows[0].id
+function readStatus(value) {
+  const status = String(value || '').trim()
+  return status === 'active' || status === 'inactive' ? status : null
+}
 
-  const guardianResult = await query(
-    `INSERT INTO guardians (user_id, ci_number)
-     VALUES ($1, $2)
-     ON CONFLICT (user_id)
-     DO UPDATE SET ci_number = EXCLUDED.ci_number, updated_at = now()
-     RETURNING id`,
-    [userId, ciNumber]
-  )
-  const guardianId = guardianResult.rows[0].id
-
-  for (let index = 0; index < studentIds.length; index += 1) {
-    await query(
+// Sincroniza los estudiantes a cargo: quita los desmarcados, agrega los nuevos con el parentesco elegido
+// y conserva intactos los vinculos que ya existian (por ejemplo, los que registro el docente).
+async function replaceGuardianStudents(run, guardianId, studentIds, relationship) {
+  await run('DELETE FROM student_guardians WHERE guardian_id = $1 AND NOT (student_id = ANY($2::uuid[]))', [
+    guardianId,
+    studentIds,
+  ])
+  for (const studentId of studentIds) {
+    await run(
       `INSERT INTO student_guardians (student_id, guardian_id, relationship, is_primary)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (student_id, guardian_id)
-       DO UPDATE SET relationship = EXCLUDED.relationship, is_primary = EXCLUDED.is_primary, created_at = now()`,
-      [studentIds[index], guardianId, relationship, index === 0]
+       VALUES ($1, $2, $3, NOT EXISTS (SELECT 1 FROM student_guardians WHERE student_id = $1))
+       ON CONFLICT (student_id, guardian_id) DO NOTHING`,
+      [studentId, guardianId, relationship]
     )
   }
+}
+
+app.post('/api/admin/guardians', authMiddleware, requireRole(...MANAGERS), async (req, res) => {
+  const payload = req.body || {}
+  const person = readPerson(payload, { requirePassword: true })
+  const ciNumber = String(payload.ci_number || '').trim()
+  const relationship = normalizeRelationship(payload.relationship)
+  const studentIds = Array.isArray(payload.student_ids) ? [...new Set(payload.student_ids.filter(Boolean))] : []
+  if (!ciNumber) return res.status(400).json({ error: 'El CI del padre / tutor es obligatorio.' })
+
+  const userId = await withTransaction(async (run) => {
+    const user = await run(
+      `INSERT INTO users (username, name, email, password_hash, role_id, phone)
+       VALUES ($1, $2, $3, crypt($4, gen_salt('bf')), (SELECT id FROM roles WHERE name = 'parent'), $5)
+       RETURNING id`,
+      [person.username, person.name, person.email, person.password, person.phone]
+    )
+    const guardian = await run(
+      'INSERT INTO guardians (user_id, ci_number) VALUES ($1, $2) RETURNING id',
+      [user.rows[0].id, ciNumber]
+    )
+    await replaceGuardianStudents(run, guardian.rows[0].id, studentIds, relationship)
+    return user.rows[0].id
+  })
 
   const data = await getManagementData()
   res.status(201).json({ item: data.parents.find((parent) => parent.user_id === userId) || null, data })
 })
 
-app.patch('/api/admin/guardians/:id', authMiddleware, requireRole('admin'), async (req, res) => {
+app.patch('/api/admin/guardians/:id', authMiddleware, requireRole(...MANAGERS), async (req, res) => {
   const guardianId = String(req.params.id || '').trim()
   const payload = req.body || {}
-  const username = String(payload.username || '').trim()
-  const name = String(payload.name || '').trim()
-  const email = String(payload.email || '').trim()
-  const phone = String(payload.phone ?? '').trim() || null
+  const person = readPerson(payload, { requirePassword: false })
   const ciNumber = String(payload.ci_number ?? '').trim()
-  const password = String(payload.password || '')
-  const relationship = String(payload.relationship || 'padre').trim() || 'padre'
-  const studentIds = Array.isArray(payload.student_ids) ? payload.student_ids.filter(Boolean) : []
+  const relationship = normalizeRelationship(payload.relationship)
+  const status = readStatus(payload.status)
+  const studentIds = Array.isArray(payload.student_ids) ? [...new Set(payload.student_ids.filter(Boolean))] : null
+  if (!ciNumber) return res.status(400).json({ error: 'El CI del padre / tutor es obligatorio.' })
 
-  if (!guardianId) return res.status(400).json({ error: 'Identificador de tutor invalido.' })
+  await withTransaction(async (run) => {
+    const found = await run('SELECT id, user_id FROM guardians WHERE id = $1', [guardianId])
+    if (found.rowCount === 0) throw new HttpError(404, 'Padre / tutor no encontrado.')
+    const userId = found.rows[0].user_id
 
-  const found = await query(
-    `SELECT g.id, g.user_id FROM guardians g WHERE g.id = $1`,
-    [guardianId]
-  )
-  if (found.rowCount === 0) return res.status(404).json({ error: 'Tutor no encontrado.' })
-  const userId = found.rows[0].user_id
-
-  if (!username || !name || !email) {
-    return res.status(400).json({ error: 'Usuario, nombre y email son obligatorios.' })
-  }
-
-  const updates = []
-  const params = []
-  let idx = 1
-  updates.push(`username = $${idx++}`)
-  params.push(username)
-  updates.push(`name = $${idx++}`)
-  params.push(name)
-  updates.push(`email = $${idx++}`)
-  params.push(email)
-  updates.push(`phone = $${idx++}`)
-  params.push(phone)
-  updates.push(`updated_at = now()`)
-  if (password) {
-    updates.push(`password_hash = crypt($${idx++}, gen_salt('bf'))`)
-    params.push(password)
-  }
-  params.push(userId)
-  await query(
-    `UPDATE users SET ${updates.join(', ')} WHERE id = $${idx}`,
-    params
-  )
-
-  if (ciNumber) {
-    await query(
-      `UPDATE guardians SET ci_number = $2, updated_at = now() WHERE id = $1`,
-      [guardianId, ciNumber]
-    )
-  }
-
-  if (studentIds.length > 0) {
-    await query(`DELETE FROM student_guardians WHERE guardian_id = $1`, [guardianId])
-    for (let index = 0; index < studentIds.length; index += 1) {
-      await query(
-        `INSERT INTO student_guardians (student_id, guardian_id, relationship, is_primary)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (student_id, guardian_id)
-         DO UPDATE SET relationship = EXCLUDED.relationship, is_primary = EXCLUDED.is_primary, created_at = now()`,
-        [studentIds[index], guardianId, relationship, index === 0]
-      )
+    const params = [userId, person.username, person.name, person.email, person.phone]
+    let sets = 'username = $2, name = $3, email = $4, phone = $5, updated_at = now()'
+    if (person.password) {
+      params.push(person.password)
+      sets += `, password_hash = crypt($${params.length}, gen_salt('bf'))`
     }
-  }
+    if (status) {
+      params.push(status)
+      sets += `, status = $${params.length}`
+    }
+    await run(`UPDATE users SET ${sets} WHERE id = $1`, params)
+    await run('UPDATE guardians SET ci_number = $2, updated_at = now() WHERE id = $1', [guardianId, ciNumber])
+    if (studentIds) await replaceGuardianStudents(run, guardianId, studentIds, relationship)
+  })
 
   const data = await getManagementData()
   res.json({ item: data.parents.find((parent) => parent.id === guardianId) || null, data })
 })
 
-app.delete('/api/admin/guardians/:id', authMiddleware, requireRole('admin'), async (req, res) => {
+// Se desactiva la cuenta (no se borra) para conservar el historial de permisos.
+app.delete('/api/admin/guardians/:id', authMiddleware, requireRole(...MANAGERS), async (req, res) => {
   const guardianId = String(req.params.id || '').trim()
-  const mode = String(req.body?.mode || req.query?.mode || 'deactivate')
-  if (!guardianId) return res.status(400).json({ error: 'Identificador de tutor invalido.' })
-
-  const found = await query(
-    `SELECT g.id, g.user_id FROM guardians g WHERE g.id = $1`,
-    [guardianId]
-  )
-  if (found.rowCount === 0) return res.status(404).json({ error: 'Tutor no encontrado.' })
-  const userId = found.rows[0].user_id
-
-  if (mode === 'delete') {
-    await query(`DELETE FROM student_guardians WHERE guardian_id = $1`, [guardianId])
-    await query(`DELETE FROM course_reviewers WHERE reviewer_id = $1`, [userId])
-    await query(`DELETE FROM guardians WHERE id = $1`, [guardianId])
-    try {
-      await query(`DELETE FROM users WHERE id = $1`, [userId])
-    } catch {
-      const data = await getManagementData()
-      return res.status(409).json({
-        error: 'No se puede borrar al usuario porque tiene solicitudes de permiso registradas a su nombre. Desactiva la cuenta en su lugar.',
-        data,
-      })
-    }
-  } else {
-    await query(`UPDATE users SET status = 'inactive', updated_at = now() WHERE id = $1`, [userId])
-  }
-
+  const found = await query('SELECT user_id FROM guardians WHERE id = $1', [guardianId])
+  if (found.rowCount === 0) return res.status(404).json({ error: 'Padre / tutor no encontrado.' })
+  await query(`UPDATE users SET status = 'inactive', updated_at = now() WHERE id = $1`, [found.rows[0].user_id])
   const data = await getManagementData()
   res.json({ data })
 })
 
-app.post('/api/admin/teachers', authMiddleware, requireRole('admin'), async (req, res) => {
+async function assertTeacher(run, teacherId) {
+  const check = await run(
+    `SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id AND r.name = 'teacher' WHERE u.id = $1`,
+    [teacherId]
+  )
+  if (check.rowCount === 0) throw new HttpError(404, 'Docente no encontrado.')
+}
+
+async function replaceTeacherCourses(run, teacherId, courseIds) {
+  await run('DELETE FROM course_reviewers WHERE reviewer_id = $1', [teacherId])
+  for (const courseId of courseIds) {
+    await run('INSERT INTO course_reviewers (course_id, reviewer_id) VALUES ($1, $2)', [courseId, teacherId])
+  }
+}
+
+function readCourseIds(value) {
+  if (!Array.isArray(value)) return null
+  const ids = [...new Set(value.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))]
+  return ids
+}
+
+app.post('/api/admin/teachers', authMiddleware, requireRole(...MANAGERS), async (req, res) => {
   const payload = req.body || {}
-  const username = String(payload.username || '').trim()
-  const name = String(payload.name || '').trim()
-  const email = String(payload.email || '').trim()
-  const password = String(payload.password || '')
-  const phone = String(payload.phone || '').trim() || null
-  const courseIds = Array.isArray(payload.course_ids) ? payload.course_ids.filter(Boolean) : []
+  const person = readPerson(payload, { requirePassword: true })
+  const courseIds = readCourseIds(payload.course_ids) || []
 
-  if (!username || !name || !email || !password) {
-    return res.status(400).json({ error: 'Completa usuario, nombre, email y contrasena del docente.' })
-  }
-
-  const roleId = (await query(`SELECT id FROM roles WHERE name = 'teacher'`)).rows[0]?.id
-  let userResult
-  try {
-    userResult = await query(
+  const userId = await withTransaction(async (run) => {
+    const user = await run(
       `INSERT INTO users (username, name, email, password_hash, role_id, phone)
-       VALUES ($1, $2, $3, crypt($4, gen_salt('bf')), $5, $6)
-       ON CONFLICT (username)
-       DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash, role_id = EXCLUDED.role_id, updated_at = now()
+       VALUES ($1, $2, $3, crypt($4, gen_salt('bf')), (SELECT id FROM roles WHERE name = 'teacher'), $5)
        RETURNING id`,
-      [username, name, email, password, roleId, phone]
+      [person.username, person.name, person.email, person.password, person.phone]
     )
-  } catch {
-    return res.status(400).json({ error: 'No se pudo crear el docente. Verifica email y usuario.' })
-  }
-  const userId = userResult.rows[0].id
-
-  if (courseIds.length > 0) {
-    await query('DELETE FROM course_reviewers WHERE reviewer_id = $1', [userId])
-    for (const courseId of courseIds) {
-      await query(
-        `INSERT INTO course_reviewers (course_id, reviewer_id)
-         VALUES ($1, $2)
-         ON CONFLICT (course_id, reviewer_id) DO NOTHING`,
-        [courseId, userId]
-      )
-    }
-  }
+    await replaceTeacherCourses(run, user.rows[0].id, courseIds)
+    return user.rows[0].id
+  })
 
   const data = await getManagementData()
   res.status(201).json({ item: data.teachers.find((teacher) => teacher.id === userId) || null, data })
 })
 
-app.patch('/api/admin/teachers/:id', authMiddleware, requireRole('admin'), async (req, res) => {
+app.patch('/api/admin/teachers/:id', authMiddleware, requireRole(...MANAGERS), async (req, res) => {
   const teacherId = String(req.params.id || '').trim()
   const payload = req.body || {}
-  const username = String(payload.username || '').trim()
-  const name = String(payload.name || '').trim()
-  const email = String(payload.email || '').trim()
-  const phone = String(payload.phone ?? '').trim() || null
-  const password = String(payload.password || '')
-  const status = String(payload.status || '').trim()
-  const courseIds = Array.isArray(payload.course_ids) ? payload.course_ids.filter(Boolean) : null
+  const person = readPerson(payload, { requirePassword: false })
+  const status = readStatus(payload.status)
+  const courseIds = readCourseIds(payload.course_ids)
 
-  if (!teacherId) return res.status(400).json({ error: 'Identificador de docente invalido.' })
-
-  const teacherCheck = await query(
-    `SELECT u.id
-     FROM users u
-     JOIN roles r ON r.id = u.role_id AND r.name = 'teacher'
-     WHERE u.id = $1`,
-    [teacherId]
-  )
-  if (teacherCheck.rowCount === 0) return res.status(404).json({ error: 'Docente no encontrado.' })
-
-  if (!username || !name || !email) {
-    return res.status(400).json({ error: 'Usuario, nombre y email son obligatorios.' })
-  }
-
-  const updates = []
-  const params = []
-  let idx = 1
-  updates.push(`username = $${idx++}`)
-  params.push(username)
-  updates.push(`name = $${idx++}`)
-  params.push(name)
-  updates.push(`email = $${idx++}`)
-  params.push(email)
-  updates.push(`phone = $${idx++}`)
-  params.push(phone)
-  updates.push(`updated_at = now()`)
-  if (password) {
-    updates.push(`password_hash = crypt($${idx++}, gen_salt('bf'))`)
-    params.push(password)
-  }
-  if (status === 'active' || status === 'inactive' || status === 'suspended') {
-    updates.push(`status = $${idx++}`)
-    params.push(status)
-  }
-  params.push(teacherId)
-  await query(
-    `UPDATE users SET ${updates.join(', ')} WHERE id = $${idx}`,
-    params
-  )
-
-  if (Array.isArray(courseIds)) {
-    await query('DELETE FROM course_reviewers WHERE reviewer_id = $1', [teacherId])
-    for (const courseId of courseIds) {
-      await query(
-        `INSERT INTO course_reviewers (course_id, reviewer_id)
-         VALUES ($1, $2)
-         ON CONFLICT (course_id, reviewer_id) DO NOTHING`,
-        [courseId, teacherId]
-      )
+  await withTransaction(async (run) => {
+    await assertTeacher(run, teacherId)
+    const params = [teacherId, person.username, person.name, person.email, person.phone]
+    let sets = 'username = $2, name = $3, email = $4, phone = $5, updated_at = now()'
+    if (person.password) {
+      params.push(person.password)
+      sets += `, password_hash = crypt($${params.length}, gen_salt('bf'))`
     }
-  }
+    if (status) {
+      params.push(status)
+      sets += `, status = $${params.length}`
+    }
+    await run(`UPDATE users SET ${sets} WHERE id = $1`, params)
+    if (courseIds) await replaceTeacherCourses(run, teacherId, courseIds)
+  })
 
   const data = await getManagementData()
   res.json({ item: data.teachers.find((teacher) => teacher.id === teacherId) || null, data })
 })
 
-app.delete('/api/admin/teachers/:id', authMiddleware, requireRole('admin'), async (req, res) => {
+app.delete('/api/admin/teachers/:id', authMiddleware, requireRole(...MANAGERS), async (req, res) => {
   const teacherId = String(req.params.id || '').trim()
-  const mode = String(req.body?.mode || req.query?.mode || 'deactivate')
-  if (!teacherId) return res.status(400).json({ error: 'Identificador de docente invalido.' })
-
-  const teacherCheck = await query(
-    `SELECT u.id
-     FROM users u
-     JOIN roles r ON r.id = u.role_id AND r.name = 'teacher'
-     WHERE u.id = $1`,
-    [teacherId]
-  )
-  if (teacherCheck.rowCount === 0) return res.status(404).json({ error: 'Docente no encontrado.' })
-
-  if (mode === 'delete') {
-    await query('DELETE FROM course_reviewers WHERE reviewer_id = $1', [teacherId])
-    try {
-      await query(`DELETE FROM users WHERE id = $1`, [teacherId])
-    } catch {
-      const data = await getManagementData()
-      return res.status(409).json({
-        error: 'No se puede borrar al docente porque tiene solicitudes de permiso asociadas. Desactiva la cuenta en su lugar.',
-        data,
-      })
-    }
-  } else {
-    await query(`UPDATE users SET status = 'inactive', updated_at = now() WHERE id = $1`, [teacherId])
-  }
-
+  await assertTeacher(query, teacherId)
+  await query(`UPDATE users SET status = 'inactive', updated_at = now() WHERE id = $1`, [teacherId])
   const data = await getManagementData()
   res.json({ data })
 })
 
-app.post('/api/admin/course-assignments', authMiddleware, requireRole('admin'), async (req, res) => {
+// Asigna el docente a uno o varios cursos (aulas). Una lista vacia le quita todos.
+app.post('/api/admin/course-assignments', authMiddleware, requireRole(...MANAGERS), async (req, res) => {
   const teacherId = String(req.body?.teacher_id || '').trim()
-  const courseIds = Array.isArray(req.body?.course_ids) ? req.body.course_ids.filter(Boolean) : []
-  if (!teacherId || courseIds.length === 0) {
-    return res.status(400).json({ error: 'Debes seleccionar un docente y al menos un curso.' })
+  const courseIds = readCourseIds(req.body?.course_ids)
+  if (!teacherId || !courseIds) {
+    return res.status(400).json({ error: 'Selecciona un docente y sus cursos.' })
   }
 
-  const teacherCheck = await query(
-    `SELECT u.id
-     FROM users u
-     JOIN roles r ON r.id = u.role_id AND r.name = 'teacher'
-     WHERE u.id = $1`,
-    [teacherId]
-  )
-  if (teacherCheck.rowCount === 0) {
-    return res.status(404).json({ error: 'Docente no encontrado.' })
-  }
-
-  await query('DELETE FROM course_reviewers WHERE reviewer_id = $1', [teacherId])
-  for (const courseId of courseIds) {
-    await query(
-      `INSERT INTO course_reviewers (course_id, reviewer_id)
-       VALUES ($1, $2)
-       ON CONFLICT (course_id, reviewer_id) DO NOTHING`,
-      [courseId, teacherId]
-    )
-  }
+  await withTransaction(async (run) => {
+    await assertTeacher(run, teacherId)
+    await replaceTeacherCourses(run, teacherId, courseIds)
+  })
 
   const data = await getManagementData()
   res.json({ data })
 })
 
-app.post('/api/admin/courses', authMiddleware, requireRole('admin'), async (req, res) => {
+app.post('/api/admin/courses', authMiddleware, requireRole(...MANAGERS), async (req, res) => {
   const payload = req.body || {}
   const name = String(payload.name || '').trim()
   const level = String(payload.level || '').trim() || null
   const schoolYear = String(payload.school_year || '').trim() || null
+  if (name.length < 3) return res.status(400).json({ error: 'Escribe el nombre del curso, por ejemplo "1ro Secundaria A".' })
 
-  if (!name) {
-    return res.status(400).json({ error: 'El nombre del curso es obligatorio.' })
-  }
-
-  let created
-  try {
-    created = await query(
-      `INSERT INTO courses (name, level, school_year)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (name) DO UPDATE SET level = EXCLUDED.level, school_year = EXCLUDED.school_year
-       RETURNING id, name, level, school_year`,
-      [name, level, schoolYear]
-    )
-  } catch {
-    return res.status(400).json({ error: 'No se pudo crear el curso. Verifica que el nombre no exista.' })
-  }
+  const created = await query(
+    `INSERT INTO courses (name, level, school_year) VALUES ($1, $2, $3)
+     RETURNING id, name, level, school_year`,
+    [name, level, schoolYear]
+  )
 
   const data = await getManagementData()
   res.status(201).json({ item: created.rows[0], data })
 })
 
+/* ------------------------------------------------------------------ */
+/* Docentes: estudiantes de sus cursos y vinculo con padres            */
+/* ------------------------------------------------------------------ */
+
 async function getTeacherCourses(userId) {
   const { rows } = await query(
-    `SELECT c.id, c.name, c.level, c.school_year,
-            (cr.reviewer_id IS NOT NULL) AS is_assigned
+    `SELECT c.id, c.name, c.level, c.school_year
      FROM courses c
-     LEFT JOIN course_reviewers cr ON cr.course_id = c.id AND cr.reviewer_id = $1
+     JOIN course_reviewers cr ON cr.course_id = c.id AND cr.reviewer_id = $1
      ORDER BY c.name`,
     [userId]
+  )
+  return rows
+}
+
+async function getTeacherStudents(userId, onlyStudentId = null) {
+  const params = [userId]
+  let filter = ''
+  if (onlyStudentId) {
+    params.push(onlyStudentId)
+    filter = 'AND s.id = $2'
+  }
+  const { rows } = await query(
+    `SELECT
+       s.id,
+       s.ru_code,
+       s.status,
+       u.id AS user_id,
+       u.username,
+       u.name,
+       u.email,
+       u.phone,
+       c.id AS course_id,
+       c.name AS course_name,
+       COALESCE(
+         json_agg(json_build_object('id', g.id, 'name', gu.name, 'ci_number', g.ci_number, 'relationship', sg.relationship)
+           ORDER BY gu.name) FILTER (WHERE g.id IS NOT NULL),
+         '[]'::json
+       ) AS guardians
+     FROM students s
+     JOIN users u ON u.id = s.user_id
+     JOIN courses c ON c.id = s.course_id
+     JOIN course_reviewers cr ON cr.course_id = c.id AND cr.reviewer_id = $1
+     LEFT JOIN student_guardians sg ON sg.student_id = s.id
+     LEFT JOIN guardians g ON g.id = sg.guardian_id
+     LEFT JOIN users gu ON gu.id = g.user_id
+     WHERE 1 = 1 ${filter}
+     GROUP BY s.id, u.id, c.id
+     ORDER BY c.name, u.name`,
+    params
   )
   return rows
 }
@@ -1187,109 +1352,150 @@ app.get('/api/teacher/courses', authMiddleware, requireRole('teacher'), async (r
 })
 
 app.get('/api/teacher/students', authMiddleware, requireRole('teacher'), async (req, res) => {
-  const { rows } = await query(
-    `SELECT
-       s.id,
-       s.ru_code,
-       s.status,
-       u.id AS user_id,
-       u.username,
-       u.name,
-       u.email,
-       u.phone,
-       c.id AS course_id,
-       c.name AS course_name
-     FROM students s
-     JOIN users u ON u.id = s.user_id
-     JOIN courses c ON c.id = s.course_id
-     JOIN course_reviewers cr ON cr.course_id = c.id AND cr.reviewer_id = $1
-     ORDER BY c.name, u.name`,
-    [req.user.id]
-  )
-  res.json({ students: rows })
+  const students = await getTeacherStudents(req.user.id)
+  res.json({ students })
 })
+
+// Padres / tutores registrados por direccion, para vincularlos con estudiantes.
+app.get('/api/teacher/guardians', authMiddleware, requireRole('teacher'), async (_req, res) => {
+  const { rows } = await query(
+    `SELECT g.id, g.ci_number, u.name
+     FROM guardians g
+     JOIN users u ON u.id = g.user_id
+     WHERE u.status = 'active'
+     ORDER BY u.name`
+  )
+  res.json({ guardians: rows })
+})
+
+async function assertTeacherCourse(run, teacherId, courseId) {
+  const check = await run('SELECT 1 FROM course_reviewers WHERE reviewer_id = $1 AND course_id = $2', [teacherId, courseId])
+  if (check.rowCount === 0) throw new HttpError(403, 'Solo puedes registrar estudiantes en los cursos que te asigno la direccion.')
+}
+
+async function linkGuardian(run, studentId, guardianId, relationship) {
+  const guardian = await run(
+    `SELECT g.id FROM guardians g JOIN users u ON u.id = g.user_id WHERE g.id = $1 AND u.status = 'active'`,
+    [guardianId]
+  )
+  if (guardian.rowCount === 0) throw new HttpError(404, 'Padre / tutor no encontrado o inactivo.')
+  const already = await run('SELECT 1 FROM student_guardians WHERE student_id = $1', [studentId])
+  const result = await run(
+    `INSERT INTO student_guardians (student_id, guardian_id, relationship, is_primary)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (student_id, guardian_id) DO UPDATE SET relationship = EXCLUDED.relationship`,
+    [studentId, guardianId, relationship, already.rowCount === 0]
+  )
+  return result
+}
 
 app.post('/api/teacher/students', authMiddleware, requireRole('teacher'), async (req, res) => {
   const payload = req.body || {}
-  const username = String(payload.username || '').trim()
-  const name = String(payload.name || '').trim()
-  const email = String(payload.email || '').trim()
-  const password = String(payload.password || '')
-  const phone = String(payload.phone || '').trim() || null
+  const person = readPerson(payload, { requirePassword: true })
   const ruCode = String(payload.ru_code || '').trim() || null
-  const courseId = payload.course_id != null ? String(payload.course_id) : ''
+  const courseId = Number(payload.course_id)
+  const guardianId = String(payload.guardian_id || '').trim()
+  const relationship = normalizeRelationship(payload.relationship)
+  if (!Number.isInteger(courseId) || courseId <= 0) return res.status(400).json({ error: 'Selecciona el curso del estudiante.' })
 
-  if (!username || !name || !email || !password || !courseId) {
-    return res.status(400).json({ error: 'Completa usuario, nombre, email, contrasena y curso.' })
-  }
-
-  const courseCheck = await query(`SELECT id FROM courses WHERE id = $1`, [courseId])
-  if (courseCheck.rowCount === 0) {
-    return res.status(404).json({ error: 'El curso seleccionado no existe.' })
-  }
-
-  await query(
-    `INSERT INTO course_reviewers (course_id, reviewer_id)
-     VALUES ($1, $2)
-     ON CONFLICT (course_id, reviewer_id) DO NOTHING`,
-    [courseId, req.user.id]
-  )
-
-  const roleId = (await query(`SELECT id FROM roles WHERE name = 'student'`)).rows[0]?.id
-  let userResult
-  try {
-    userResult = await query(
+  const studentId = await withTransaction(async (run) => {
+    await assertTeacherCourse(run, req.user.id, courseId)
+    const user = await run(
       `INSERT INTO users (username, name, email, password_hash, role_id, phone)
-       VALUES ($1, $2, $3, crypt($4, gen_salt('bf')), $5, $6)
-       ON CONFLICT (username)
-       DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash, updated_at = now()
+       VALUES ($1, $2, $3, crypt($4, gen_salt('bf')), (SELECT id FROM roles WHERE name = 'student'), $5)
        RETURNING id`,
-      [username, name, email, password, roleId, phone]
+      [person.username, person.name, person.email, person.password, person.phone]
     )
-  } catch {
-    return res.status(400).json({ error: 'No se pudo crear el usuario. Verifica email y usuario.' })
-  }
-  const userId = userResult.rows[0].id
-
-  let studentResult
-  try {
-    studentResult = await query(
-      `INSERT INTO students (user_id, ru_code, course_id)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (user_id)
-       DO UPDATE SET ru_code = EXCLUDED.ru_code, course_id = EXCLUDED.course_id, updated_at = now()
-       RETURNING id`,
-      [userId, ruCode, courseId]
+    const student = await run(
+      'INSERT INTO students (user_id, ru_code, course_id) VALUES ($1, $2, $3) RETURNING id',
+      [user.rows[0].id, ruCode, courseId]
     )
-  } catch {
-    return res.status(400).json({ error: 'No se pudo crear el alumno. El RUDE ya existe para otro estudiante.' })
-  }
-  const studentId = studentResult.rows[0].id
+    if (guardianId) await linkGuardian(run, student.rows[0].id, guardianId, relationship)
+    return student.rows[0].id
+  })
 
-  const { rows } = await query(
-    `SELECT
-       s.id,
-       s.ru_code,
-       s.status,
-       u.id AS user_id,
-       u.username,
-       u.name,
-       u.email,
-       u.phone,
-       c.id AS course_id,
-       c.name AS course_name
-     FROM students s
-     JOIN users u ON u.id = s.user_id
-     JOIN courses c ON c.id = s.course_id
-     WHERE s.id = $1`,
-    [studentId]
-  )
+  const [item] = await getTeacherStudents(req.user.id, studentId)
+  res.status(201).json({ item: item || null })
+})
 
-  res.status(201).json({ item: rows[0] || null })
+async function assertTeacherStudent(teacherId, studentId) {
+  const [student] = await getTeacherStudents(teacherId, studentId)
+  if (!student) throw new HttpError(403, 'Ese estudiante no pertenece a tus cursos.')
+}
+
+// El docente corrige los datos del estudiante, lo cambia entre sus cursos o lo marca como retirado.
+app.patch('/api/teacher/students/:id', authMiddleware, requireRole('teacher'), async (req, res) => {
+  const studentId = String(req.params.id)
+  const payload = req.body || {}
+  const person = readPerson(payload, { requirePassword: false })
+  const ruCode = String(payload.ru_code || '').trim() || null
+  const courseId = Number(payload.course_id)
+  const status = readStatus(payload.status) || 'active'
+  if (!Number.isInteger(courseId) || courseId <= 0) return res.status(400).json({ error: 'Selecciona el curso del estudiante.' })
+
+  await assertTeacherStudent(req.user.id, studentId)
+  await withTransaction(async (run) => {
+    await assertTeacherCourse(run, req.user.id, courseId)
+    const found = await run('SELECT user_id FROM students WHERE id = $1', [studentId])
+    const params = [found.rows[0].user_id, person.username, person.name, person.email, person.phone, status]
+    let sets = 'username = $2, name = $3, email = $4, phone = $5, status = $6, updated_at = now()'
+    if (person.password) {
+      params.push(person.password)
+      sets += `, password_hash = crypt($${params.length}, gen_salt('bf'))`
+    }
+    await run(`UPDATE users SET ${sets} WHERE id = $1`, params)
+    await run('UPDATE students SET ru_code = $2, course_id = $3, status = $4, updated_at = now() WHERE id = $1', [
+      studentId,
+      ruCode,
+      courseId,
+      status,
+    ])
+  })
+
+  const [item] = await getTeacherStudents(req.user.id, studentId)
+  res.json({ item: item || null })
+})
+
+app.post('/api/teacher/students/:id/guardians', authMiddleware, requireRole('teacher'), async (req, res) => {
+  const studentId = String(req.params.id)
+  const guardianId = String(req.body?.guardian_id || '').trim()
+  if (!guardianId) return res.status(400).json({ error: 'Selecciona un padre / tutor.' })
+  await assertTeacherStudent(req.user.id, studentId)
+  await withTransaction((run) => linkGuardian(run, studentId, guardianId, normalizeRelationship(req.body?.relationship)))
+  const [item] = await getTeacherStudents(req.user.id, studentId)
+  res.json({ item })
+})
+
+app.delete('/api/teacher/students/:id/guardians/:guardianId', authMiddleware, requireRole('teacher'), async (req, res) => {
+  const studentId = String(req.params.id)
+  await assertTeacherStudent(req.user.id, studentId)
+  await query('DELETE FROM student_guardians WHERE student_id = $1 AND guardian_id = $2', [studentId, String(req.params.guardianId)])
+  const [item] = await getTeacherStudents(req.user.id, studentId)
+  res.json({ item })
 })
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Ruta no encontrada.' })
+})
+
+// Errores no controlados: siempre se responde JSON con un mensaje entendible.
+// eslint-disable-next-line no-unused-vars
+app.use((error, _req, res, _next) => {
+  if (error instanceof HttpError) return res.status(error.status).json({ error: error.message })
+  if (error?.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Los adjuntos son demasiado pesados. Maximo 5 MB por archivo.' })
+  }
+  if (error?.code === '23505') {
+    return res.status(409).json({ error: UNIQUE_MESSAGES[error.constraint] || 'Ese registro ya existe.' })
+  }
+  if (error?.code === '22P02' || error?.code === '23503') {
+    return res.status(400).json({ error: 'Alguno de los datos seleccionados no existe.' })
+  }
+  if (error?.code === '23514') {
+    return res.status(400).json({ error: 'Revisa los datos: alguno no tiene el formato esperado.' })
+  }
+  console.error(error)
+  res.status(500).json({ error: 'Error interno del servidor.' })
 })
 
 async function start() {

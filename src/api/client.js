@@ -1,6 +1,7 @@
 const DEFAULT_API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000/api'
 const TOKEN_KEY = 'colegio.session.token'
 const USER_KEY = 'colegio.session.user'
+export const SESSION_EXPIRED_EVENT = 'colegio:session-expired'
 
 export function getStoredToken() {
   try {
@@ -60,6 +61,11 @@ export async function apiRequest(path, { method = 'GET', body, auth = true, toke
   }
 
   const data = await response.json().catch(() => ({}))
+  // Token vencido, invalido o cuenta desactivada: se cierra la sesion en toda la app.
+  if (response.status === 401 && effectiveToken) {
+    clearStoredSession()
+    window.dispatchEvent(new CustomEvent(SESSION_EXPIRED_EVENT, { detail: data.error }))
+  }
   if (!response.ok) {
     return {
       ok: false,

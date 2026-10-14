@@ -56,9 +56,9 @@ CREATE TABLE IF NOT EXISTS roles (
 
 -- Semilla inicial de roles
 INSERT INTO roles (name, description) VALUES
-    ('admin',     'Regente / Direccion - control total y gestion de credenciales'),
-    ('inspector', 'Inspectoria - acompanamiento y disciplina'),
-    ('teacher',   'Docente / Tutor - revisa permisos de sus cursos asignados'),
+    ('admin',     'Direccion - gestiona padres, docentes y decide permisos'),
+    ('inspector', 'Inspectoria - gestiona padres, docentes y decide permisos'),
+    ('teacher',   'Docente - registra estudiantes de sus cursos y los vincula con sus padres'),
     ('parent',    'Padre / Tutor - solicita permisos para sus hijos'),
     ('student',   'Estudiante - no solicita permisos, solo ve su panel de faltas')
 ON CONFLICT (name) DO NOTHING;
@@ -325,7 +325,9 @@ DECLARE
     act audit_action;
 BEGIN
     IF (TG_OP = 'INSERT') THEN
-        act := 'create';
+        INSERT INTO audit_logs(actor_id, action, entity_type, entity_id, metadata)
+        VALUES (NEW.applicant_id, 'create', 'leave_requests', NEW.id::text,
+                jsonb_build_object('to', NEW.status, 'tracking_code', NEW.tracking_code));
     ELSIF (TG_OP = 'DELETE') THEN
         INSERT INTO audit_logs(actor_id, action, entity_type, entity_id, metadata)
         VALUES (NULL, 'delete', 'leave_requests', OLD.id::text,
@@ -342,14 +344,18 @@ BEGIN
             END CASE;
             INSERT INTO audit_logs(actor_id, action, entity_type, entity_id, metadata)
             VALUES (
-                COALESCE(NEW.reviewed_by, NEW.pre_reviewed_by),
+                CASE WHEN NEW.status IN ('pending', 'cancelled') THEN NEW.applicant_id
+                     WHEN NEW.status = 'pre_approved' THEN NEW.pre_reviewed_by
+                     ELSE NEW.reviewed_by END,
                 act,
                 'leave_requests',
                 NEW.id::text,
                 jsonb_build_object(
                     'from', OLD.status,
                     'to',   NEW.status,
-                    'comment', COALESCE(NEW.review_comment, NEW.pre_review_comment)
+                    'comment', CASE WHEN NEW.status IN ('pending', 'cancelled') THEN NULL
+                                    WHEN NEW.status = 'pre_approved' THEN NEW.pre_review_comment
+                                    ELSE NEW.review_comment END
                 )
             );
         END IF;
@@ -431,9 +437,7 @@ ON CONFLICT (student_id, guardian_id) DO NOTHING;
 -- Asignacion docente -> cursos
 INSERT INTO course_reviewers (course_id, reviewer_id) VALUES
     ((SELECT id FROM courses WHERE name='1ro Secundaria A'), (SELECT id FROM users WHERE username='docente')),
-    ((SELECT id FROM courses WHERE name='2do Secundaria A'), (SELECT id FROM users WHERE username='docente')),
-    ((SELECT id FROM courses WHERE name='3ro Secundaria A'), (SELECT id FROM users WHERE username='inspectoria')),
-    ((SELECT id FROM courses WHERE name='1ro Secundaria B'), (SELECT id FROM users WHERE username='rectora'))
+    ((SELECT id FROM courses WHERE name='2do Secundaria A'), (SELECT id FROM users WHERE username='docente'))
 ON CONFLICT (course_id, reviewer_id) DO NOTHING;
 
 -- Solicitudes demo funcionales
@@ -475,24 +479,6 @@ INSERT INTO leave_requests (
         NULL,
         NULL,
         NULL,
-        NULL,
-        NULL,
-        NULL
-    ),
-    (
-        'LIC-2026-0003',
-        (SELECT id FROM users WHERE username='docente'),
-        'staff',
-        NULL,
-        (SELECT id FROM courses WHERE name='1ro Secundaria A'),
-        'institutional',
-        now() + interval '5 day',
-        now() + interval '5 day',
-        'Permiso institucional para actividad academica externa.',
-        'pre_approved',
-        (SELECT id FROM users WHERE username='docente'),
-        now() - interval '1 day',
-        'Se remite a direccion para decision final.',
         NULL,
         NULL,
         NULL

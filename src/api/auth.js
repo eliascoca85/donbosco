@@ -10,10 +10,10 @@ export const ROLES = {
 
 export const ROLE_LABELS = {
   student: 'Estudiante',
-  parent: 'Padre / Tutor',
+  parent: 'Padre / Madre / Tutor',
   teacher: 'Docente',
   inspector: 'Inspectoría',
-  admin: 'Administracion / Direccion',
+  admin: 'Dirección',
 }
 
 export function getCurrentUser() {
@@ -26,6 +26,8 @@ export async function restoreCurrentUser() {
   if (!token) return cached
 
   const res = await apiRequest('/auth/me')
+  // Sin conexion o error del servidor: se conserva la sesion guardada en lugar de expulsar al usuario.
+  if (!res.ok && res.status !== 401) return cached
   if (!res.ok || !res.user) {
     clearStoredSession()
     return null
